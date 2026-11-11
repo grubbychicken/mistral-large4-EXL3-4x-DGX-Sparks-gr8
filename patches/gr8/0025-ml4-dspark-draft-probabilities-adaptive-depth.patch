@@ -1,0 +1,176 @@
+From b86a224bff1a46a409df567b2b155506e92d585d Mon Sep 17 00:00:00 2001
+From: grubbychicken <ben@grbychkn.com>
+Date: Tue, 10 Nov 2026 13:09:29 +0000
+Subject: [PATCH] ML4 DSpark: the drafts log-probabilities (softmax of head +
+ markov over the vocabulary; each rank its slice, merged in rank order: the
+ same bits on every rank) and ML4 costs for --spec-adaptive (spec_len.h
+ ml4_cost): prose 23.2 -> 25.4 tok/s, the same tokens
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ engine/runtime/engine_options.h |  3 +++
+ engine/runtime/ml4_dspark.cuh   | 40 +++++++++++++++++++++++++--------
+ engine/runtime/spec_len.h       | 16 +++++++++++++
+ 3 files changed, 50 insertions(+), 9 deletions(-)
+
+diff --git a/engine/runtime/engine_options.h b/engine/runtime/engine_options.h
+index 0ec14f1..747a495 100644
+--- a/engine/runtime/engine_options.h
++++ b/engine/runtime/engine_options.h
+@@ -183,6 +183,9 @@ inline void fill(const g6opt_options& c, EngineOptions& o)
+     SpecLen& s = o.spec;
+     s.on = c.spec_on; s.levels = ints(c.spec_levels); s.draft_round = c.spec_draft_round; s.draft_each = c.spec_draft_each;
+     std::copy(c.spec_table, c.spec_table + SpecLen::KX + 2, s.table);
++#if G6_MODEL_ML4
++    s.ml4_cost();                       // ML4's verify table, drafting cost and seeds (GR8_SPEC_TABLE still overrides the table under S2)
++#endif
+ #if G6_MODEL_FLASH
+     o.spec_initial = s;
+ #endif
+diff --git a/engine/runtime/ml4_dspark.cuh b/engine/runtime/ml4_dspark.cuh
+index d75b319..3ac0930 100644
+--- a/engine/runtime/ml4_dspark.cuh
++++ b/engine/runtime/ml4_dspark.cuh
+@@ -56,7 +56,7 @@ struct DflIn
+ struct DflOut
+ {
+     int tok[dfl::B];                  // tok[r] = draft for position q0 + r (r = 1..3)
+-    float lp[dfl::B];                 // 0: the head reports no draft probabilities
++    float lp[dfl::B];                 // lp[r]: draft r's log-probability under the head (softmax of head + markov over the vocabulary)
+ };
+ struct DflMeta { int mask_id = 0, nr = 0, block = 0, layers = 0, window = 0; int tl[dfl::NT] = {}; float theta = 0, eps = 0; bool sel = false; };
+ struct DLayer
+@@ -79,6 +79,7 @@ struct Dfl
+     int nc = 0;
+     int* cell = nullptr;
+     int *tok = nullptr, *qpos = nullptr, *sel_tok = nullptr;
++    float* sel_lp = nullptr;          // [Q] the drafts' log-probabilities (k_pick_merge)
+     const __nv_bfloat16* emb = nullptr;      // the target's token embeddings
+     const int* emb_rows = nullptr;
+     float* freq = nullptr;                    // [32] YaRN
+@@ -390,7 +391,7 @@ __global__ void __launch_bounds__(256) k_rnn(const float* jp, const __nv_bfloat1
+         markov[c] = __float2half_rn(o);
+     }
+ }
+-struct Pick { float value; int id; int bad; int pad; };
++struct Pick { float value; int id; int bad; float lse; };   // lse: log sum exp of this rank's slice (for the draft's probability)
+ // this rank's best of head + markov over its vocab slice (the markov logits rounded to BF16 as the reference stores
+ // them; the lowest id on a tie) -> its send slot of collective c. grid 1, block 1024
+ __global__ void __launch_bounds__(1024) k_pick(const float* hlog, const float* arlog, int vn, int vlo, g6::FabricDev f, const u64* stepp,
+@@ -415,6 +416,7 @@ __global__ void __launch_bounds__(1024) k_pick(const float* hlog, const float* a
+     }
+     if ((threadIdx.x & 31) == 0) { bv[threadIdx.x >> 5] = val; bi[threadIdx.x >> 5] = id; bb[threadIdx.x >> 5] = bad; }
+     __syncthreads();
++    __shared__ float top;
+     if (threadIdx.x == 0)
+     {
+         for (int w = 1; w < 32; ++w)
+@@ -422,34 +424,53 @@ __global__ void __launch_bounds__(1024) k_pick(const float* hlog, const float* a
+             bad |= bb[w];
+             if (bv[w] > val || (bv[w] == val && bi[w] < id)) { val = bv[w]; id = bi[w]; }
+         }
++        top = val;
++    }
++    __syncthreads();
++    // sum of exp(x - top) over the slice, in a fixed order (thread stride, the warp's xor tree, warps ascending): a rank's
++    // lse depends on its slice alone, and every rank merges the four picks in rank order (k_pick_merge), so the draft's
++    // log-probability is the same bits on every rank (spec_len.h: the adaptive draft count needs that)
++    float se = 0;
++    for (int j = threadIdx.x; j < vn; j += 1024) se += expf(hlog[j] + bfr(arlog[j]) - top);
++    for (int o = 16; o > 0; o >>= 1) se += __shfl_xor_sync(0xffffffffu, se, o);
++    if ((threadIdx.x & 31) == 0) bv[threadIdx.x >> 5] = se;
++    __syncthreads();
++    if (threadIdx.x == 0)
++    {
++        for (int w = 1; w < 32; ++w) se += bv[w];
+         const u64 step = *stepp;
+         Pick* p = reinterpret_cast<Pick*>(glue::send_slot(f, step, c));
+-        p->value = val; p->id = vlo + id; p->bad = bad; p->pad = 0;
++        p->value = val; p->id = vlo + id; p->bad = bad; p->lse = top + logf(se);
+         glue::publish(f, c, g6::coll_seq(step, c, f.ncoll), ticket);
+     }
+ }
+ // the ranks' picks of collective c -> the draft of row i (the larger value, the lower id on a tie; -1 when any is bad)
+-__global__ void k_pick_merge(g6::FabricDev f, const u64* stepp, int c, int* sel, int i)
++// lp[i]: the draft's log-probability, its logit minus the log sum exp of the ranks' slices (added in rank order); NaN when bad
++__global__ void k_pick_merge(g6::FabricDev f, const u64* stepp, int c, int* sel, float* lp, int i)
+ {
+     if (threadIdx.x) return;
+     const u64 step = *stepp;
+     int bad = 0, id = 0x7fffffff;
+-    float val = -INFINITY;
++    float val = -INFINITY, lse[g6nr::NR];
+     for (int p = 0; p < g6nr::NR; ++p)
+     {
+         const Pick* q = reinterpret_cast<const Pick*>(glue::peer_slot(f, step, c, p));
+         const float v = __ldcv(&q->value);
+         const int d = __ldcv(&q->id);
+         bad |= __ldcv(&q->bad);
++        lse[p] = __ldcv(&q->lse);
+         if (v > val || (v == val && d < id)) { val = v; id = d; }
+     }
++    float se = 0;
++    for (int p = 0; p < g6nr::NR; ++p) se += expf(lse[p] - val);
+     sel[i] = bad ? -1 : id;
++    lp[i] = bad ? NAN : -logf(se);
+ }
+-__global__ void k_out(const int* sel, DflOut* out)
++__global__ void k_out(const int* sel, const float* lp, DflOut* out)
+ {
+     if (threadIdx.x) return;
+     out->tok[0] = 0; out->lp[0] = 0.f;
+-    for (int r = 1; r < B; ++r) { out->tok[r] = sel[r - 1]; out->lp[r] = 0.f; }
++    for (int r = 1; r < B; ++r) { out->tok[r] = sel[r - 1]; out->lp[r] = lp[r - 1]; }
+ }
+ // a fill step: this rank's prompt-context rows of tap slot s (FILL rows, zero where it is not the owner) -> collective s.
+ // grid 1, block 512
+@@ -501,6 +522,7 @@ inline void dfl_build(Dfl& D, const Model& main, const Find& find, const DflMeta
+     D.tok = dmalloc<int>(B);
+     D.qpos = dmalloc<int>(B);
+     D.sel_tok = dmalloc<int>(Q);
++    D.sel_lp = dmalloc<float>(Q);
+     D.freq = dmalloc<float>(32);
+     {   // the YaRN ramp's ends (the reference's yarnEndpoints)
+         const double orig = 512, th = 10000;
+@@ -766,9 +788,9 @@ inline void dfl_phase(Dfl& D, int p, cudaStream_t st, bool query = true)
+     const int i = p - (2 * L + 1);    // 1 .. Q: row i-1's picks merged; row i's head, or the output
+     const int c = 1 + 2 * L + i - 1;
+     dfl_wait(D, c, sizeof(dspk::Pick), st);
+-    dspk::k_pick_merge<<<1, 32, 0, st>>>(D.f, D.stepp, c, D.sel_tok, i - 1);
++    dspk::k_pick_merge<<<1, 32, 0, st>>>(D.f, D.stepp, c, D.sel_tok, D.sel_lp, i - 1);
+     if (i < Q) dfl_ar(D, i, st);
+-    else dspk::k_out<<<1, 32, 0, st>>>(D.sel_tok, D.out);
++    else dspk::k_out<<<1, 32, 0, st>>>(D.sel_tok, D.sel_lp, D.out);
+ }
+ inline void dfl_step(Dfl& D, cudaStream_t st, bool query = true)
+ {
+diff --git a/engine/runtime/spec_len.h b/engine/runtime/spec_len.h
+index de343eb..c58a9c1 100644
+--- a/engine/runtime/spec_len.h
++++ b/engine/runtime/spec_len.h
+@@ -114,6 +114,22 @@ struct SpecLen
+         draft_round = tp == 4 ? 2.6 : tp == 3 ? 2.39 : 2.8;
+         draft_each = tp == 4 ? 1.25 : tp == 3 ? 1.94 : 2.2;
+     }
++#endif
++#if G6_MODEL_ML4
++    // Mistral Large 4 on four Sparks (TP4 ring, EXL3 3 bpw, DSpark head of 3 drafts): verify ms by rows 1..4 = the p50
++    // of offline graph steps at a short context (the recipe's tools/s4_dec.sh with S4_K 1 / 2 / 3 and plain, 2026-11-10:
++    // each row past the first reads its own experts, 13-16 ms), rows 5..8 extrapolated at the last step (the head drafts
++    // three); the DSpark proposal 8.7 ms a round whatever the count. At 28K context the four are 58.4 / 81.0 / 98.2 /
++    // 115.7: about 1.25x each, which moves no decision much. Seeds: the head's rates on code and prose (NOTES D0).
++    void ml4_cost()
++    {
++        static const double t[KX + 2] = {0, 47.1, 63.3, 77.3, 90.6, 104.0, 117.4, 130.8, 144.2};
++        static const double s[KX + 1] = {0, 0.80, 0.78, 0.75, 0.75, 0.75, 0.75, 0.75};
++        std::copy(t, t + KX + 2, table);
++        std::copy(s, s + KX + 1, seed);
++        draft_round = 8.7;
++        draft_each = 0;
++    }
+ #endif
+     double verify_ms(int rows) const { return table[std::min(std::max(rows, 1), KX + 1)]; }
+     double draft_ms(int drafted) const { return draft_round + draft_each * std::max(0, drafted - 1); }
+-- 
+2.43.0
+

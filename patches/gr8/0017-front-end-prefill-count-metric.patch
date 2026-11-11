@@ -1,0 +1,44 @@
+From 1e54360b5d4928bb00a114ac2843032e732d1dd6 Mon Sep 17 00:00:00 2001
+From: gr8-ml4 <benjamin.j.millar@gmail.com>
+Date: Mon, 9 Nov 2026 23:17:58 +0000
+Subject: [PATCH] front end: vllm:request_prefill_time_seconds_count (with the
+ sum and computed tokens, dashboards take the true prefill rate)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ frontend/g6front-rs/src/metrics.rs | 5 +++++
+ frontend/g6s2shim.py               | 2 +-
+ 2 files changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/frontend/g6front-rs/src/metrics.rs b/frontend/g6front-rs/src/metrics.rs
+index 52a2c3e..fff8190 100644
+--- a/frontend/g6front-rs/src/metrics.rs
++++ b/frontend/g6front-rs/src/metrics.rs
+@@ -166,6 +166,11 @@ pub fn render(m: &Value, model_name: &str, front: Front) -> String {
+                 "vllm:request_prefill_time_seconds_sum",
+                 "Seconds from a request's admission to its first token, summed over finished requests.",
+             ),
++            (
++                "prefill_count",
++                "vllm:request_prefill_time_seconds_count",
++                "Finished requests the prefill time sum covers (dashboards divide the computed tokens by the seconds).",
++            ),
+             (
+                 "decode_sum",
+                 "vllm:request_decode_time_seconds_sum",
+diff --git a/frontend/g6s2shim.py b/frontend/g6s2shim.py
+index cdf2835..c864ee5 100644
+--- a/frontend/g6s2shim.py
++++ b/frontend/g6s2shim.py
+@@ -556,7 +556,7 @@ class Shim:
+              'tokens': {'prompt': c['prompt'], 'generation': c['gen']},
+              'latency': {'ttft_sum': c['ttft_sum'], 'ttft_count': c['ttft_count'], 'itl_sum': c['itl_sum'],
+                          'itl_count': c['itl_count'],
+-                         'prefill_sum': c['prefill_sum'], 'decode_sum': c['decode_sum'],
++                         'prefill_sum': c['prefill_sum'], 'prefill_count': c['done_count'], 'decode_sum': c['decode_sum'],
+                          'prefill_tokens_sum': c['prefill_tokens'], 'gen_tokens_sum': c['gen_tokens'],
+                          'gen_tokens_count': c['done_count']}}
+         if c['cached'] is not None:   # only an engine that reports its prefix reuse gives cached tokens
+-- 
+2.43.0
+

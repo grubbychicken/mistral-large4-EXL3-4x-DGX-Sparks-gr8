@@ -1,0 +1,155 @@
+From 836a8ef6741a4a1585f0542747cef6210c2dfb91 Mon Sep 17 00:00:00 2001
+From: grubbychicken <ben@grbychkn.com>
+Date: Tue, 10 Nov 2026 08:44:00 +0000
+Subject: [PATCH] ML4 DSpark: a fill step carries dfl::FILL = CR (32)
+ prompt-context rows instead of 4 (the drafter slots hold MX rows; same bits):
+ the 2048-position fill 470 -> 107 ms
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ engine/runtime/dflash.cuh     |  1 +
+ engine/runtime/g6m4.cu        | 14 +++++++-------
+ engine/runtime/ml4_dspark.cuh | 20 +++++++++++---------
+ 3 files changed, 19 insertions(+), 16 deletions(-)
+
+diff --git a/engine/runtime/dflash.cuh b/engine/runtime/dflash.cuh
+index 453d949..20beac3 100644
+--- a/engine/runtime/dflash.cuh
++++ b/engine/runtime/dflash.cuh
+@@ -51,6 +51,7 @@ namespace g6rt
+ namespace dfl
+ {
+ constexpr int B = 8, K = B - 1;               // block rows (bonus + drafts) = verify rows
++constexpr int FILL = B;                       // prompt-context rows a fill step carries
+ static_assert(B == g6mod::INFO.dfl_block, "the drafter's block rows and the module description (module_info.h) differ");
+ constexpr int L = geom::DFL_L, NT = geom::DFL_NT;   // drafter layers, tapped target layers (6, 6; Flash 5, 5)
+ constexpr int HD = 128, NH = geom::DFL_NH, NKV = 8, INTER = 12288;   // q heads: 64, Flash 32
+diff --git a/engine/runtime/g6m4.cu b/engine/runtime/g6m4.cu
+index 32ac80c..8e96810 100644
+--- a/engine/runtime/g6m4.cu
++++ b/engine/runtime/g6m4.cu
+@@ -1444,14 +1444,14 @@ int main(int argc, char** argv)
+             };
+             // a session alone takes the DFlash2-wide KDA ring at its first round (s2/flash_native.cuh widen)
+             ext.dfl_ok = [&](int q) { return dwin.ok(q); };
+-            ext.dfl_start = [&](int q) {     // the prefill's taps -> the drafter's context ring, 8 rows a fill step
++            ext.dfl_start = [&](int q) {     // the prefill's taps -> the drafter's context ring, dfl::FILL rows a fill step
+                 if (!dwin.fills(q)) return dwin.start(q);
+-                for (int c0 = dwin.from; c0 < DF.pf_hi; c0 += dfl::B)
++                for (int c0 = dwin.from; c0 < DF.pf_hi; c0 += dfl::FILL)
+                 {
+                     DflIn di;
+                     memset(&di, 0, sizeof di);
+                     di.step = ++s2_dstep;
+-                    di.ctx_rows = std::min(dfl::B, DF.pf_hi - c0); di.ctx_pos0 = c0; di.q0 = c0 + di.ctx_rows; di.lo = DF.pf_lo;
++                    di.ctx_rows = std::min(dfl::FILL, DF.pf_hi - c0); di.ctx_pos0 = c0; di.q0 = c0 + di.ctx_rows; di.lo = DF.pf_lo;
+                     *in_f = di;
+                     dfl_enqueue(fabf, di.step, dfl_fill_sizes(), true);
+                     G6RT_CK(cudaGraphLaunch(exec_f[2], st));
+@@ -2787,12 +2787,12 @@ int main(int argc, char** argv)
+                 int on_dfl_start(int q) {    // the offline loop's fill steps: Dfl::pf_feat -> the ring
+                     if (dfl_owner != q || DF.pf_hi <= DF.pf_lo) return (int)slot_prompt[q] - 1;
+                     const auto t0 = std::chrono::steady_clock::now();
+-                    for (int c0 = dfl_from; c0 < DF.pf_hi; c0 += dfl::B)
++                    for (int c0 = dfl_from; c0 < DF.pf_hi; c0 += dfl::FILL)
+                     {
+                         DflIn di;
+                         memset(&di, 0, sizeof di);
+                         di.step = ++s2_dstep;
+-                        di.ctx_rows = std::min(dfl::B, DF.pf_hi - c0); di.ctx_pos0 = c0; di.q0 = c0 + di.ctx_rows; di.lo = DF.pf_lo;
++                        di.ctx_rows = std::min(dfl::FILL, DF.pf_hi - c0); di.ctx_pos0 = c0; di.q0 = c0 + di.ctx_rows; di.lo = DF.pf_lo;
+                         *in_f = di;
+                         dfl_enqueue(fabf, di.step, dfl_fill_sizes(), true);
+                         G6RT_CK(cudaGraphLaunch(exec_f[2], st));
+@@ -3383,12 +3383,12 @@ int main(int argc, char** argv)
+         if (dfl && DF.pf_feat && DF.pf_hi > DF.pf_lo)
+         {
+             const auto t0 = std::chrono::steady_clock::now();
+-            for (int c0 = DF.pf_lo; c0 < DF.pf_hi; c0 += dfl::B)
++            for (int c0 = DF.pf_lo; c0 < DF.pf_hi; c0 += dfl::FILL)
+             {
+                 DflIn di;
+                 memset(&di, 0, sizeof di);
+                 di.step = ++dstep;
+-                di.ctx_rows = std::min(dfl::B, DF.pf_hi - c0); di.ctx_pos0 = c0; di.q0 = c0 + di.ctx_rows; di.lo = DF.pf_lo;
++                di.ctx_rows = std::min(dfl::FILL, DF.pf_hi - c0); di.ctx_pos0 = c0; di.q0 = c0 + di.ctx_rows; di.lo = DF.pf_lo;
+                 *in_f = di;
+                 dfl_enqueue(fabf, di.step, dfl_fill_sizes(), true);
+                 if (graph) G6RT_CK(cudaGraphLaunch(exec_f[2], st));
+diff --git a/engine/runtime/ml4_dspark.cuh b/engine/runtime/ml4_dspark.cuh
+index c72e914..d75b319 100644
+--- a/engine/runtime/ml4_dspark.cuh
++++ b/engine/runtime/ml4_dspark.cuh
+@@ -33,6 +33,7 @@ constexpr int INTER = 24576, NIR = INTER / g6nr::NR;                   // 6144 a
+ constexpr int NFR = HID / g6nr::NR;                                    // target_projection outputs a rank
+ constexpr int JIN = 512 + 512 + HID, JOUT = 1536, ST = 512;
+ constexpr int CR = MX;                        // context rows a draft step carries at most (a prompt step's chunk)
++constexpr int FILL = CR;                      // prompt-context rows a fill step carries (the drafter's slots hold MX rows)
+ constexpr int RING = 4096, WIN = 2048;
+ constexpr int NC = 1 + 2 * L + Q;             // 0 tp slices, 1 + 2j / 2 + 2j layer j partials, 7 + i row i's picks
+ constexpr int NPH = NC + 1;
+@@ -450,21 +451,22 @@ __global__ void k_out(const int* sel, DflOut* out)
+     out->tok[0] = 0; out->lp[0] = 0.f;
+     for (int r = 1; r < B; ++r) { out->tok[r] = sel[r - 1]; out->lp[r] = 0.f; }
+ }
+-// a fill step: this rank's prompt-context rows of tap slot s (zero where it is not the owner) -> collective s. grid 1, block 128
+-__global__ void __launch_bounds__(128) k_fill_put(const __half* pf, const int* cell, int s, g6::FabricDev f, const u64* stepp, unsigned* ticket)
++// a fill step: this rank's prompt-context rows of tap slot s (FILL rows, zero where it is not the owner) -> collective s.
++// grid 1, block 512
++__global__ void __launch_bounds__(512) k_fill_put(const __half* pf, const int* cell, int s, g6::FabricDev f, const u64* stepp, unsigned* ticket)
+ {
+     const u64 step = *stepp;
+     const int rows = cell[C_ROWS], p0 = cell[C_POS0] - cell[C_LO];
+     uint4* dst = reinterpret_cast<uint4*>(glue::send_slot(f, step, s));
+     constexpr int W = HID * 2 / 16;
+-    for (int i = threadIdx.x; i < B * W; i += 128)
++    for (int i = threadIdx.x; i < FILL * W; i += 512)
+     {
+         const int m = i / W, w = i % W;
+         dst[i] = m < rows ? reinterpret_cast<const uint4*>(pf + ((size_t)(p0 + m) * NT + s) * HID)[w] : make_uint4(0, 0, 0, 0);
+     }
+     glue::publish(f, s, g6::coll_seq(step, s, f.ncoll), ticket);
+ }
+-// the ranks' rows summed (exactly one is non-zero) -> feat. grid (HID / 256, B, NT), block 256
++// the ranks' rows summed (exactly one is non-zero) -> feat. grid (HID / 256, FILL, NT), block 256
+ __global__ void __launch_bounds__(256) k_fill_get(g6::FabricDev f, const u64* stepp, __half* feat)
+ {
+     const u64 step = *stepp;
+@@ -634,7 +636,7 @@ inline std::vector<uint32_t> dfl_sizes(const Dfl& D, bool query)
+ }
+ inline std::vector<uint32_t> dfl_fill_sizes()
+ {
+-    std::vector<uint32_t> v(dfl::NT, (uint32_t)(dfl::B * HID * 2));
++    std::vector<uint32_t> v(dfl::NT, (uint32_t)(dfl::FILL * HID * 2));
+     v.push_back((uint32_t)(dfl::CR * dfl::NFR * 4));
+     return v;
+ }
+@@ -773,7 +775,7 @@ inline void dfl_step(Dfl& D, cudaStream_t st, bool query = true)
+     for (int p = 0; p < (query ? dfl::NPH : 2); ++p) dfl_phase(D, p, st, query);
+ }
+ constexpr bool dfl_delivered(int p, bool query) { return p < dfl::NC && (query || p == 0); }
+-// a fill step (prompt context from Dfl::pf_feat, B rows): 0 = the NT feature gathers out; 1 = in, tp slices out
++// a fill step (prompt context from Dfl::pf_feat, FILL rows): 0 = the NT feature gathers out; 1 = in, tp slices out
+ // (collective NT); 2 = the context part
+ constexpr int DFL_FILL_PH = 3;
+ inline void dfl_fill_phase(Dfl& D, int p, cudaStream_t st)
+@@ -782,13 +784,13 @@ inline void dfl_fill_phase(Dfl& D, int p, cudaStream_t st)
+     if (p == 0)
+     {
+         dfl_in(D, st);
+-        for (int s = 0; s < NT; ++s) dspk::k_fill_put<<<1, 128, 0, st>>>(D.pf_feat, D.cell, s, D.f, D.stepp, D.tickets + s);
++        for (int s = 0; s < NT; ++s) dspk::k_fill_put<<<1, 512, 0, st>>>(D.pf_feat, D.cell, s, D.f, D.stepp, D.tickets + s);
+         return;
+     }
+     if (p == 1)
+     {
+-        for (int s = 0; s < NT; ++s) dfl_wait(D, s, (size_t)B * HID * 2, st);
+-        dspk::k_fill_get<<<dim3(HID / 256, B, NT), 256, 0, st>>>(D.f, D.stepp, D.feat);
++        for (int s = 0; s < NT; ++s) dfl_wait(D, s, (size_t)FILL * HID * 2, st);
++        dspk::k_fill_get<<<dim3(HID / 256, FILL, NT), 256, 0, st>>>(D.f, D.stepp, D.feat);
+         dfl_bfrag(D.feat, NT * HID, CR, D.xb_feat, st);
+         bind::launch(D.tp, st);
+         k_put_publish<<<16, 128, 0, st>>>(reinterpret_cast<const uint4*>(D.tpo), D.f, D.stepp, NT, (int)((size_t)CR * NFR * 4 / 16), D.tickets + NT);
+-- 
+2.43.0
+

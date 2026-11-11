@@ -1,0 +1,111 @@
+From d2a9a6255931402c67743ac0abc278a9302ad434 Mon Sep 17 00:00:00 2001
+From: gr8-ml4 <benjamin.j.millar@gmail.com>
+Date: Mon, 9 Nov 2026 20:11:30 +0000
+Subject: [PATCH] ML4: the CP attention block past R (ML4 inputs, compacted
+ output; cp_front takes KV-sharing layers)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ engine/attn/attn.cu     |  2 +-
+ engine/runtime/rank.cuh | 28 ++++++++++++++++++++++++----
+ 2 files changed, 25 insertions(+), 5 deletions(-)
+
+diff --git a/engine/attn/attn.cu b/engine/attn/attn.cu
+index 5851f35..a0134a5 100644
+--- a/engine/attn/attn.cu
++++ b/engine/attn/attn.cu
+@@ -1165,7 +1165,7 @@ static int cp_call(const G6Attn* a,const G6AttnStepCell* cell,void* scratch,size
+     return (int)body(*a,w);
+ }
+ extern "C" int g6a_cp_front(const G6Attn* a,const G6AttnStepCell* cell,void* scratch,size_t bytes,void* s){
+-    if(!a||!a->q_b||!a->uk||!a->kv_a||!a->kv_norm||!a->mla_cache||!a->positions||!a->block_table||!a->error||!a->indices)return (int)cudaErrorInvalidValue;
++    if(!a||!a->q_b||!a->uk||!G6A_KV_IN(*a)||!a->mla_cache||!a->positions||!a->block_table||!a->error||!a->indices)return (int)cudaErrorInvalidValue;
+     if(!a->reuse_indices&&(!a->index_q||!a->index_weight||!a->index_k||!a->index_norm||!a->index_bias||!a->index_cache))return (int)cudaErrorInvalidValue;
+     if(a->reuse_row_map&&a->reuse_indices==a->indices)return (int)cudaErrorInvalidValue;
+     cudaStream_t stream=(cudaStream_t)s;
+diff --git a/engine/runtime/rank.cuh b/engine/runtime/rank.cuh
+index d075971..e3d185d 100644
+--- a/engine/runtime/rank.cuh
++++ b/engine/runtime/rank.cuh
+@@ -1519,6 +1519,9 @@ inline bool cp_block(const Model& m, int context)
+ //   2: wait the nr-1 partials of my heads, LSE merge in shard order, value_project, then o_proj and publish(2i) as today
+ // S3 and S1 run the same kernels on the same inputs (only the order differs), so they are byte-identical (gate A).
+ // qph (phase 0 only, QsPh): the GR8_QA_SPLIT / GR8_IDXQ_SPLIT gather phase of phase 0 the loopback driver wants (-1 = all)
++#if G6_MODEL_ML4
++inline void launch_attn_in_ml4(Model& m, int i, const Layer& y, const bind::Layer& b, int M, cudaStream_t st, bool noiq);
++#endif
+ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaStream_t st, int qph = -1)
+ {
+     Layer& y = m.layers[i];
+@@ -1550,6 +1553,10 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
+     if (phase <= 0)
+     {
+         if (!srp && m.graph && !y.rp_on[m.cur][M]) die("prepare(m, M) was not called before a graph step");
++#if G6_MODEL_ML4
++        if (qph >= 0) die("ML4: no gather phases (GR8_QA_SPLIT)");
++        launch_attn_in_ml4(m, i, y, b, M, st, false);   // its own xf_x; the CP index runs the indexer query (no GR8_ATTN_POSIDX)
++#else
+         if (P.on())
+         {
+             dmark(DP_OTHER, st);
+@@ -1563,6 +1570,7 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
+         launch_qb_idxq(m, i, b, M, st, P);
+         if (!P.on()) return;                  // an earlier gather phase of phase 0
+         dmark(DP_QB, st);
++#endif
+         for (int k = DP_A_APPEND; k <= DP_A_VPROJ; ++k) dmark(k, st);   // the replicated path's attention marks (CP: all in DP_ATTN)
+         if (!srp && !m.graph)
+         {
+@@ -1650,7 +1658,11 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
+ #endif
+     G6RT_CK(g6_attn_cp_finish(a, cell, scr, sb, C.part_all, st));
+     dmark(DP_ATTN, st);
++#if G6_MODEL_ML4
++    ml4::compact((const __half*)a->output, b.heads, m.attn_c, M, st);
++#else
+     bind::launch(b.xf_attn, st);
++#endif
+     bind::launch_o_proj(b, st);
+ #ifdef DEC_SLOT
+     slot_publish(m, 2 * i, st);
+@@ -1667,10 +1679,9 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
+ // Mistral Large 4 (the recipe's docs/PORT.md section 6): kv_a, the indexer's k and weights and wq on x; q in GLM's
+ // layout (ml4::qprep: ssmax, sqrt(2), zero lanes); on indexer layers the LayerNorm query (ml4::ln, wq_b, ml4::ssmax); GLM's
+ // attention core; its output compacted to 128 value dims for wo (dtr).
+-inline void launch_attn_block_ml4(Model& m, int i, int M, int context, cudaStream_t st)
++// the block's inputs: kv_a, indexer k / weights, q (qprep), the indexer query; shared by the CP block (launch_attn_cp)
++inline void launch_attn_in_ml4(Model& m, int i, const Layer& y, const bind::Layer& b, int M, cudaStream_t st, bool noiq)
+ {
+-    Layer& y = m.layers[i];
+-    const bind::Layer& b = layer_for(m, i, M);
+     if (m.qs.mode) die("ML4: GR8_QA_SPLIT is not supported");
+     dmark(DP_OTHER, st);
+ #ifdef DEC_SLOT
+@@ -1684,7 +1695,7 @@ inline void launch_attn_block_ml4(Model& m, int i, int M, int context, cudaStrea
+     dmark(DP_QA, st);
+     bind::launch_q_b(b, st);                  // wq -> m.q_raw
+     ml4::qprep(m.q_raw, m.pos, y.ssmax, y.ab.head_begin, b.heads, geom::rope(y.l) ? 1 : 0, m.q_b, M, st);
+-    if (y.indexer && !posidx_step(m, i, M))
++    if (y.indexer && !noiq)
+     {
+         ml4::ln(m.x, HID, y.idx_qn, HID, m.x_ln, HID, M, st);
+         bind::launch(b.xf_qa, st);            // fragments of x_ln
+@@ -1692,6 +1703,15 @@ inline void launch_attn_block_ml4(Model& m, int i, int M, int context, cudaStrea
+         ml4::ssmax(m.idx_q, m.pos, y.idx_ss, geom::IDX_HEADS, geom::IDX_DIM, M, st);
+     }
+     dmark(DP_QB, st);
++}
++inline void launch_attn_block_ml4(Model& m, int i, int M, int context, cudaStream_t st)
++{
++#if defined(G6_CP) && G6_CP
++    if (cp_block(m, context)) { launch_attn_cp(m, i, M, context, -1, st); return; }   // past R: the CP block (ML4 in and out)
++#endif
++    Layer& y = m.layers[i];
++    const bind::Layer& b = layer_for(m, i, M);
++    launch_attn_in_ml4(m, i, y, b, M, st, posidx_step(m, i, M));
+ #ifdef DEC_S2
+     if (m.s2on) s2_attention(m, i, M, st);
+     else
+-- 
+2.43.0
+

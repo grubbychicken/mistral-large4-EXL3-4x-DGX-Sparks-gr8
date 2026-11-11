@@ -1,0 +1,108 @@
+From 6fe5c716ede75a48371c9a79bc54054630dbf795 Mon Sep 17 00:00:00 2001
+From: gr8-ml4 <benjamin.j.millar@gmail.com>
+Date: Mon, 9 Nov 2026 23:10:34 +0000
+Subject: [PATCH] ML4 S2: runs past R without a draft Model (the page bound is
+ the logical pool); shim counts prompt tokens as the prefill goes
+
+- s2_most: without a draft Model the page classes still hand a run past R its drafter-class pages above place; the
+  bound is the logical pool (the main model takes only pages below its own pool_pages). A 33K session died on
+  s2_set_exclusive: 520 pages, want 1..352
+- g6s2shim: vllm:prompt_tokens_total grew by the whole prompt at admission, so dashboards read 26-43K tok/s
+  prefill for one sample; now by the engine f lines, the rest with the first tokens or the end
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ engine/runtime/s2.cuh        |  5 ++++-
+ engine/runtime/s2/native.cuh |  2 +-
+ frontend/g6s2shim.py         | 15 ++++++++++++++-
+ 3 files changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/engine/runtime/s2.cuh b/engine/runtime/s2.cuh
+index 676553b..a881967 100644
+--- a/engine/runtime/s2.cuh
++++ b/engine/runtime/s2.cuh
+@@ -258,7 +258,10 @@ inline const G6Attn& s2_args0(const Model& m)
+ }
+ // the S2 models: the main one and the MTP draft (none at K = 0: ML4 serves with its DFlash2 drafter only, D.d unbuilt)
+ inline std::vector<Model*> s2_models(Model& m, Model& d) { return d.nl ? std::vector<Model*>{&m, &d} : std::vector<Model*>{&m}; }
+-inline int s2_most(const Model& m, const Model& d) { return d.nl ? std::max(m.s2->pool_pages, d.s2->pool_pages) : m.s2->pool_pages; }
++// the page ids a run's list may hold: with a draft Model its pool (the drafter class above place spans the logical pool);
++// without one the logical pool all the same (the page classes still hand a run past R its drafter-class pages, which
++// the main model skips: every helper takes only the pages below its own pool_pages)
++inline int s2_most(const Model& m, const Model& d) { return d.nl ? std::max(m.s2->pool_pages, d.s2->pool_pages) : std::max(m.s2->pool_pages, m.s2->table_cap); }
+ inline int s2_place(const Model& m, const Model& d) { return d.nl ? std::min(m.s2->pool_pages, d.s2->pool_pages) : m.s2->pool_pages; }
+ // once per model, after build, before any S2 step: nslots session slots (views on the pool). The layers' own bindings
+ // stay allocated but unused while s2on.
+diff --git a/engine/runtime/s2/native.cuh b/engine/runtime/s2/native.cuh
+index 395542d..d9d0bda 100644
+--- a/engine/runtime/s2/native.cuh
++++ b/engine/runtime/s2/native.cuh
+@@ -225,7 +225,7 @@ class NativeDispatch {
+                 // tables as built. ex_split records which at bind (the pool's mode), not the list's shape
+                 if (c_.main.s2->ex_split[next])
+                 {
+-                    const int most = dr() ? std::max(c_.main.s2->pool_pages, c_.draft.d.s2->pool_pages) : c_.main.s2->pool_pages;
++                    const int most = g6rt::s2_most(c_.main, c_.draft.d);
+                     const int rp = c_.main.s2->rp[next];
+                     g6rt::s2_solo_cp_pages(c_.main, run, most, rp);
+                     if (dr()) g6rt::s2_solo_cp_pages(c_.draft.d, run, most, rp);
+diff --git a/frontend/g6s2shim.py b/frontend/g6s2shim.py
+index 7edc213..cdf2835 100644
+--- a/frontend/g6s2shim.py
++++ b/frontend/g6s2shim.py
+@@ -436,6 +436,7 @@ class Req:
+         self.t_tok = None        # its latest tokens line
+         self.reused = None       # prompt rows the engine took from its prefix reuse: the "a" line's last field, if it has one
+         self.prefilled = 0       # the engine's last "f" line: prompt rows prefilled so far
++        self.counted = 0         # prompt rows already in the prompt-token counter (count_prompt)
+ 
+ 
+ class Shim:
+@@ -465,9 +466,20 @@ class Shim:
+         except Exception as e:  # a dead front end must not kill the engine loop
+             log.warning('write to front end failed: %r', e)
+ 
++    def count_prompt(self, r: Req, upto):
++        """The prompt-token counter (vllm:prompt_tokens_total) as the prefill goes: rows the engine reports prefilled
++        ("f" lines), the rest with the first tokens or the end. Dashboards take its rate as prefill tok/s, so a whole
++        prompt counted at admission read as one 30K-token second."""
++        n = min(int(upto), len(r.f['prompt']))
++        if n > r.counted:
++            self.c['prompt'] += n - r.counted
++            r.counted = n
++
+     def finish(self, r: Req, reason, ct=0, stop_id=None, message=None):
+         if r.done:
+             return
++        if r.ordinal is not None:
++            self.count_prompt(r, len(r.f['prompt']))
+         r.done = True
+         if r.ordinal is not None:
+             self.active.pop(r.ordinal, None)
+@@ -714,7 +726,6 @@ class Shim:
+                 r.last = time.monotonic()
+                 self.active[ordinal] = r
+                 await self.command(f"ADMIT {self.cfg['epoch']} {ordinal} {payload_hash(body)}\n")
+-                self.c['prompt'] += len(r.f['prompt'])
+                 self.c['max_active'] = max(self.c['max_active'], len(self.active))
+                 log.info('req.%d %s: %d prompt, n_gen %s admitted to the queue (%d in flight)', ordinal, r.rid,
+                          len(r.f['prompt']), r.f['max_tokens'], len(self.active))
+@@ -750,6 +761,7 @@ class Shim:
+                 c['pc_queries'] += len(r.f['prompt'])
+         elif w[0] == 'f':   # prompt rows prefilled so far: life during a long prefill (pump stamps r.last), no text
+             r.prefilled = int(w[1])
++            self.count_prompt(r, r.prefilled)
+         elif w[0] == 'l':
+             r.lps.append(lp_entry(w[1:]))
+         elif w[0] == 'p':
+@@ -767,6 +779,7 @@ class Shim:
+                     return self.abandon(r, 'error', ct=r.emitted, message='engine returned incomplete prompt logprobs')
+                 self.send(r, {'type': 'prompt_logprobs', 'id': r.rid, 'lps': [None] + [r.plps[j] for j in range(1, n)]})
+             if ids:
++                self.count_prompt(r, len(r.f['prompt']))
+                 now = time.monotonic()
+                 if r.t_first is None:
+                     r.t_first = now
+-- 
+2.43.0
+

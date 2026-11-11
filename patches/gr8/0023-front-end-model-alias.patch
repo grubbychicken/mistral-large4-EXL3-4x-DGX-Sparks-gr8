@@ -1,0 +1,92 @@
+From d4d05db13926dbfc89a21c149928d1b83f3ac987 Mon Sep 17 00:00:00 2001
+From: grubbychicken <ben@grbychkn.com>
+Date: Tue, 10 Nov 2026 11:52:32 +0000
+Subject: [PATCH] front end: --model-alias NAME ... - names a request may use
+ that /v1/models does not list (a dashboard counts every listed id as a loaded
+ model)
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ frontend/g6front-rs/src/api.rs  |  2 +-
+ frontend/g6front-rs/src/main.rs | 17 ++++++++++++++++-
+ 2 files changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/frontend/g6front-rs/src/api.rs b/frontend/g6front-rs/src/api.rs
+index c306181..20d0683 100644
+--- a/frontend/g6front-rs/src/api.rs
++++ b/frontend/g6front-rs/src/api.rs
+@@ -367,7 +367,7 @@ impl State {
+     fn check_model(&self, body: &Map<String, Value>) -> Result<(), ApiError> {
+         match body.get("model") {
+             None | Some(Value::Null) => Ok(()),
+-            Some(Value::String(m)) if self.served.iter().any(|s| s == m) => Ok(()),
++            Some(Value::String(m)) if self.served.iter().chain(self.aliases.iter()).any(|s| s == m) => Ok(()),
+             Some(m) => {
+                 let m = m.as_str().map_or_else(|| m.to_string(), str::to_string);
+                 Err(ApiError::new(404, &format!("The model `{m}` does not exist."), Some("model")))
+diff --git a/frontend/g6front-rs/src/main.rs b/frontend/g6front-rs/src/main.rs
+index e440960..d3cb18c 100644
+--- a/frontend/g6front-rs/src/main.rs
++++ b/frontend/g6front-rs/src/main.rs
+@@ -48,6 +48,8 @@ pub struct State {
+     pub ds_effort: u32,
+     pub engine: Arc<engine::Engine>,
+     pub served: Vec<String>,
++    /// --model-alias: names a request may also use; /v1/models does not list them
++    pub aliases: Vec<String>,
+     pub model_name: String,
+     pub model_dir: String,
+     pub reasoning_fields: &'static [&'static str],
+@@ -82,6 +84,7 @@ struct Args {
+     host: String,
+     port: u16,
+     served: Option<Vec<String>>,
++    aliases: Vec<String>,
+     dialect: Option<dialect::Dialect>,
+     max_model_len: u64,
+     reasoning_fields: String,
+@@ -104,7 +107,7 @@ struct Args {
+ }
+ 
+ const USAGE: &str = "usage: g6front-rs --model-dir DIR [--engine-sock PATH] [--host H] [--port N]
+-                  [--dialect glm|ds41|auto] [--served-model-name NAME ...] [--max-model-len N]
++                  [--dialect glm|ds41|auto] [--served-model-name NAME ...] [--model-alias NAME ...] [--max-model-len N]
+                   [--reasoning-fields both|reasoning|reasoning_content]
+                   [--enable-prompt-tokens-details] [--log-level LEVEL]
+                   [--workers N] [--encode-threads N] [--default-max-tokens N]
+@@ -124,6 +127,7 @@ fn parse_args() -> Result<Args, String> {
+         host: "0.0.0.0".into(),
+         port: 8100,
+         served: None,
++        aliases: Vec::new(),
+         dialect: None,
+         max_model_len: 0,
+         reasoning_fields: "reasoning".into(),
+@@ -262,6 +266,16 @@ fn parse_args() -> Result<Args, String> {
+                 }
+                 a.served = Some(served);
+             }
++            // names a request may use as well; not in /v1/models (a dashboard counts every listed id as a loaded model)
++            "--model-alias" => match inline {
++                Some(v) => a.aliases.push(v),
++                None => {
++                    while i + 1 < argv.len() && !argv[i + 1].starts_with("--") {
++                        i += 1;
++                        a.aliases.push(argv[i].clone());
++                    }
++                }
++            },
+             "-h" | "--help" => {
+                 println!("{USAGE}");
+                 std::process::exit(0);
+@@ -404,6 +418,7 @@ async fn serve(args: Args) -> Result<(), String> {
+         engine: engine.clone(),
+         model_name: served[0].clone(),
+         served,
++        aliases: args.aliases,
+         model_dir: args.model_dir,
+         reasoning_fields,
+         prompt_tokens_details: args.prompt_tokens_details,
+-- 
+2.43.0
+

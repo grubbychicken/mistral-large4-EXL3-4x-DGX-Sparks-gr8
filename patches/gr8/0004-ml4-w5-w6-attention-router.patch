@@ -1,0 +1,1058 @@
+From 8a2c945c28f0bbfc996f43351a366e9b60f0999f Mon Sep 17 00:00:00 2001
+From: Benjamin Millar <benjamin.j.millar@gmail.com>
+Date: Mon, 9 Nov 2026 12:59:45 +0000
+Subject: [PATCH] ML4 W5/W6: ML4 attention block and router in the rank step,
+ G6_MODEL_ML4 only
+
+- attention: FP16 latent row (kvfmt f16ml4, 1152 B), LeRoPE x YaRN frequencies from G.rope_freq (g6a_ml4_rope),
+  NoPE layers (indexer no_rope), KV-sharing layers (kv_shared, g6a_ml4_bind_kv_alias; append checks skip them),
+  generic mla_scores / context_parts for the FP16 row
+- kernels/ml4_glue.cuh: q prep into the core 256-wide layout (ssmax, sqrt 2), indexer LayerNorm and ssmax,
+  output compaction to 128 value dims, final logit softcap
+- glue: k_router_plan_ml4 (softmax top-4 of 128 + the shared expert as route 4); tests/router_ml4_test.cu
+- bind / rank: make_layer_ml4, launch_attn_block_ml4, F16W head; prefill router refuses ML4 (not ported)
+- m4sim: GR8_MOE_TOPK check for ML4
+
+Verified: m4sim on the 5-layer subset (0,1,3,35,39) vs an fp32 PyTorch reference: argmax 64/64 at 1, 4, 8 rows;
+GLM build: attn.cu SASS identical to the parent commit, m4sim / bind / ops objects identical.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ engine/attn/attn.cu                     |  62 +++++++++--
+ engine/attn/attn.h                      |  14 +++
+ engine/attn/bind.cu                     |  21 +++-
+ engine/attn/decode-small.cuh            |  10 +-
+ engine/attn/kvfmt.h                     |   8 ++
+ engine/kernels/bind.cuh                 |  78 ++++++++++++-
+ engine/kernels/bind_prefill.cuh         |   6 +
+ engine/kernels/glue.cuh                 | 140 +++++++++++++++++++++++-
+ engine/kernels/ml4_glue.cuh             | 101 +++++++++++++++++
+ engine/kernels/tests/router_ml4_test.cu |  73 ++++++++++++
+ engine/runtime/m4sim.cu                 |   2 +
+ engine/runtime/rank.cuh                 | 107 ++++++++++++++++++
+ 12 files changed, 605 insertions(+), 17 deletions(-)
+ create mode 100644 engine/kernels/ml4_glue.cuh
+ create mode 100644 engine/kernels/tests/router_ml4_test.cu
+
+diff --git a/engine/attn/attn.cu b/engine/attn/attn.cu
+index 70853de..5851f35 100644
+--- a/engine/attn/attn.cu
++++ b/engine/attn/attn.cu
+@@ -160,9 +160,21 @@ __device__ __forceinline__ bool cp_remote(const G6Attn& a,int pos){return a.cp_n
+ #define CP_MINE(a,pos) true
+ #define CP_REMOTE_ROW(a,pos)
+ #endif
++#if G6_MODEL_ML4
++// Mistral Large 4: LeRoPE on YaRN (transformers MistralLarge4TextRotaryEmbedding): f_j = inv_freq_j * exp(alpha_j) in fp32,
++// set once by g6a_ml4_rope (the converter's G.rope_freq); the angle is the fp32 product pos * f_j as the reference forms
++// it, sin / cos in double of that angle (attention_factor 1.0: no magnitude scale)
++__device__ float g_ml4_freq[32];
++__device__ void cs(int pos,int j,float& c,float& s){
++    const float ang=(float)pos*g_ml4_freq[j];double sd,cd;sincos((double)ang,&sd,&cd);c=(float)cd;s=(float)sd;
++}
++#define NOROPE(a) ((a).no_rope)
++#else
+ __device__ void cs(int pos,int j,float& c,float& s){
+     double sd,cd;sincos((double)pos*exp((-2.*j/64)*log(8000000.)),&sd,&cd);c=(float)cd;s=(float)sd;
+ }
++#define NOROPE(a) false
++#endif
+ #if PF_ROPE2
+ // PF_ROPE2: {cos,sin} from the PF_QOROPE table (bit-equal to cs for pos < cap), set at QO create; cs beyond cap or before
+ __device__ const float2* g_rope=nullptr;__device__ int g_rope_cap=0;
+@@ -249,16 +261,30 @@ __global__ void fwht_rows(float* p,int rows){
+     for(int k=0;k<16;k++)r[lane+32*k]=x[k]*HSCALE;
+ }
+ #define KV4_ROTATE(p,rows,st) do{if((rows)>0)ga::fwht_rows<<<((rows)+7)/8,256,0,(st)>>>((p),(rows));}while(0)
++#elif G6_MODEL_ML4
++__device__ float latent(const uint8_t* v,int d){return __half2float(((const half*)v)[d]);}
++#define KV4_ROTATE(p,rows,st) do{}while(0)
+ #else
+ __device__ float latent(const uint8_t* v,int d){return e4(v[d])*((const float*)(v+512))[d/128];}
+ #define KV4_ROTATE(p,rows,st) do{}while(0)
+ #endif
++// the rope key of a cache row: BF16 on GLM, FP16 on ML4 (kvfmt.h)
++#if G6_MODEL_ML4
++__device__ __forceinline__ float rope_key(const uint8_t* v,int d){return __half2float(((const half*)(v+g6kv::ROPE_OFF))[d]);}
++__device__ __forceinline__ void rope_put(uint8_t* v,int d,float x){((half*)(v+g6kv::ROPE_OFF))[d]=__float2half_rn(x);}
++#else
++__device__ __forceinline__ float rope_key(const uint8_t* v,int d){return __bfloat162float(((const bf16*)(v+g6kv::ROPE_OFF))[d]);}
++__device__ __forceinline__ void rope_put(uint8_t* v,int d,float x){((bf16*)(v+g6kv::ROPE_OFF))[d]=__float2bfloat16_rn(x);}
++#endif
+ 
+ // The bodies of append_kv / append_index / prep_index / reuse take their row (and head, thread, shared slot) as arguments so
+ // attn_front (GR8_ATTN_FRONT) can run them in one launch; the kernels below call them with the launch indices.
+ template<class Input>
+ __device__ __forceinline__ void append_kv_row(Input input,int row){
+     auto a=resolve(input);if(!a.active)return;
++#if G6_MODEL_ML4
++    if(a.kv_shared)return;   // the source layer appended this row's latent earlier in the step
++#endif
+     int t=threadIdx.x,pos=a.positions[row];FOR_ROW(a,input,row);CP_REMOTE_ROW(a,pos)int pg=page(a,pos);if(pg<0)return;
+     __shared__ float v[512],sums[8],sc[4];
+     float ss=0;
+@@ -283,6 +309,9 @@ __device__ __forceinline__ void append_kv_row(Input input,int row){
+         if(l==0)((half*)(dst+g6kv::SCALE_OFF))[g]=s;}}
+     __syncthreads();
+     dst[t]=(uint8_t)(code[2*t]|(code[2*t+1]<<4));
++#elif G6_MODEL_ML4
++    uint8_t* dst=(uint8_t*)a.mla_cache+((int64_t)pg*a.page_size+pos%a.page_size)*KV_BYTES;
++    for(int d=t;d<512;d+=256){if(!isfinite(v[d]))error(a,4);((half*)dst)[d]=__float2half_rn(v[d]);}
+ #else
+     if(t<4){float mx=0;for(int d=t*128;d<(t+1)*128;d++)mx=fmaxf(mx,fabsf(v[d]));sc[t]=fp8_scale(mx);}
+     __syncthreads();
+@@ -291,7 +320,7 @@ __device__ __forceinline__ void append_kv_row(Input input,int row){
+     if(t<4)((float*)(dst+512))[t]=sc[t];
+ #endif
+     if(t<32){float c,s;RCS(pos,t,c,s);float x=hfloat(a.kv_a,(int64_t)row*576+512+2*t),y=hfloat(a.kv_a,(int64_t)row*576+513+2*t);
+-        ((bf16*)(dst+g6kv::ROPE_OFF))[2*t]=__float2bfloat16_rn(x*c-y*s);((bf16*)(dst+g6kv::ROPE_OFF))[2*t+1]=__float2bfloat16_rn(y*c+x*s);}
++        rope_put(dst,2*t,x*c-y*s);rope_put(dst,2*t+1,y*c+x*s);}
+ }
+ template<class Input>
+ __global__ void append_kv(Input input){append_kv_row(input,blockIdx.x);}
+@@ -306,7 +335,7 @@ __device__ __forceinline__ void append_index_row(Input input,int r,int t,int hf)
+     float mean=(sum[0]+sum[1]+sum[2]+sum[3])/128;
+     float dx=x-mean;float ss=warp_sum(dx*dx);__syncthreads();if((t&31)==0)sum[t/32]=ss;__syncthreads();
+     v[t]=dx*rsqrtf((sum[0]+sum[1]+sum[2]+sum[3])/128+1e-6f)*bfloat(a.index_norm,t)+bfloat(a.index_bias,t);__syncthreads();
+-    if(t<32){float c,s;RCS(pos,t,c,s);float a=v[2*t],b=v[2*t+1];v[2*t]=a*c-b*s;v[2*t+1]=b*c+a*s;}__syncthreads();
++    if(t<32&&!NOROPE(a)){float c,s;RCS(pos,t,c,s);float a=v[2*t],b=v[2*t+1];v[2*t]=a*c-b*s;v[2*t+1]=b*c+a*s;}__syncthreads();
+     float mx=warp_max(fabsf(v[t]));if((t&31)==0)sum[t/32]=mx;__syncthreads();
+     if(t==0)scale=exp2f(ceilf(log2f(fmaxf(fmaxf(fmaxf(sum[0],sum[1]),fmaxf(sum[2],sum[3])),1e-4f)/448.f)));__syncthreads();
+     uint8_t* base=(uint8_t*)a.index_cache+(int64_t)pg*a.page_size*IDX_BYTES;
+@@ -320,7 +349,7 @@ __device__ __forceinline__ void prep_index_row(Input input,int start,half* q,flo
+     auto a=resolve(input);if(!a.active)return;
+     int r=start+row;__shared__ float v_[NH][128],maxima_[NH][4],scale_[NH];float* v=v_[hf];float* maxima=maxima_[hf];float& scale=scale_[hf];
+     v[t]=hfloat(a.index_q,((int64_t)r*32+h)*128+t);__syncthreads();
+-    if(t<32){float c,s;RCS(a.positions[r],t,c,s);float x=v[2*t],y=v[2*t+1];v[2*t]=x*c-y*s;v[2*t+1]=y*c+x*s;}__syncthreads();
++    if(t<32&&!NOROPE(a)){float c,s;RCS(a.positions[r],t,c,s);float x=v[2*t],y=v[2*t+1];v[2*t]=x*c-y*s;v[2*t+1]=y*c+x*s;}__syncthreads();
+     float mx=warp_max(fabsf(v[t]));if((t&31)==0)maxima[t/32]=mx;__syncthreads();
+     if(t==0){float am=fmaxf(fmaxf(maxima[0],maxima[1]),fmaxf(maxima[2],maxima[3]));scale=exp2f(ceilf(log2f(fmaxf(am,1e-10f)/448.f)));
+         w[row*32+h]=hfloat(a.index_weight,(int64_t)r*32+h)*scale*(1.f/64.f);}
+@@ -433,7 +462,7 @@ __global__ void mla_scores(Input input,int start,const float* q,const float* rop
+     int row=blockIdx.z,r=start+row,h=blockIdx.y,j=blockIdx.x*8+threadIdx.x/32,lane=threadIdx.x%32,t=threadIdx.x;FOR_ROW(a,input,r);
+     __shared__ float qr[512],rp[64];for(int d=t;d<512;d+=256)qr[d]=q[((int64_t)row*a.heads+h)*512+d];if(t<64)rp[t]=rope[((int64_t)row*a.heads+h)*64+t];__syncthreads();
+     int id=a.indices[(int64_t)r*TOP+j];const uint8_t* v=(id>=0&&id<=a.positions[r]&&CP_MINE(a,id))?kv_at(a,id):nullptr;float sum=0;
+-    if(v){for(int d=lane;d<512;d+=32)sum=fmaf(qr[d],latent(v,d),sum);for(int d=lane;d<64;d+=32)sum=fmaf(rp[d],__bfloat162float(((const bf16*)(v+g6kv::ROPE_OFF))[d]),sum);}
++    if(v){for(int d=lane;d<512;d+=32)sum=fmaf(qr[d],latent(v,d),sum);for(int d=lane;d<64;d+=32)sum=fmaf(rp[d],rope_key(v,d),sum);}
+     sum=warp_sum(sum);if(lane==0)score[((int64_t)row*a.heads+h)*TOP+j]=v?sum*(1.f/16):-INFINITY;
+ }
+ template<class Input>
+@@ -459,7 +488,7 @@ __global__ void context_parts(Input input,int start,const float* probs,float* pa
+     const float prob=p[slot];const uint8_t* src=nullptr;
+     if(id>=0&&id<=a.positions[r]&&prob!=0)src=kv_at(a,id);
+     rows[t]=(uintptr_t)src;probability[t]=prob;
+-#if G6_KV4
++#if G6_KV4 || G6_MODEL_ML4
+     __syncthreads();
+     #pragma unroll 4
+     for(int j=0;j<TOP/PART;j++){
+@@ -648,7 +677,7 @@ static int& avp1_on(){static int v=knob::avp1();return v;}
+ // with 32 / 64 gathered pairs per batch, 3 / 4 = context_pk with 16 / 32 (two batches in flight): bit-identical parts.
+ // FP8 KV only. Host-side, read once (before graph capture); tests may assign it.
+ static int& attn_ctx2(){static int v=[]{
+-#if G6_KV4
++#if G6_KV4 || G6_MODEL_ML4
+     return 0;
+ #else
+     return int(knob::attn_ctx2());
+@@ -662,7 +691,7 @@ static int& attn_ctx2(){static int v=[]{
+ // per-row indexer reads each key tile once for up to G rows of one session. Both bit-identical, decode run_body only.
+ // Host-side, read once (before graph capture); tests may assign them.
+ static int& attn_ctx3(){static int v=[]{
+-#if G6_KV4
++#if G6_KV4 || G6_MODEL_ML4
+     return 0;
+ #else
+     return int(knob::attn_ctx3());
+@@ -675,7 +704,7 @@ static int& attn_idx_grp(){static int v=int(knob::idx_grp());return v;}
+ // GR8_ATTN_QT=1 (run_body, use_qt: absorb_m2 above stores q / rope lane-transposed and scores_sc reads them with 16 B loads;
+ // FP8 KV only), GR8_ATTN_FRONT=1 (g6_attn_replay_run: attn_front).
+ static int& attn_qt(){static int v=[]{
+-#if G6_KV4
++#if G6_KV4 || G6_MODEL_ML4
+     return 0;
+ #else
+     return knob::attn_qt()?1:0;
+@@ -690,7 +719,7 @@ static int& attn_front_on(){static int v=knob::attn_front();return v;}
+ // the positional index (pos_index) instead of prep_index + index_scores + the selector; larger capacities, shared layers
+ // and the CP entry points are unchanged.
+ static int& attn_ctx3_sp(){static int v=[]{
+-#if G6_KV4
++#if G6_KV4 || G6_MODEL_ML4
+     return 0;
+ #else
+     return int(knob::attn_ctx3_sp());
+@@ -1053,8 +1082,13 @@ extern "C" size_t g6a_scratch_bytes(const G6Attn* a){if(!a||!ga::valid(*a))retur
+ extern "C" int g6a_ctx_sp(void){return ga::attn_ctx3_sp();}
+ extern "C" int g6a_posidx(void){return ga::attn_posidx();}
+ extern "C" int g6a_posidx_takes(const G6Attn* a){return a&&ga::use_posidx(*a)?1:0;}
++#if G6_MODEL_ML4
++#define G6A_KV_IN(a) ((a).kv_shared||((a).kv_a&&(a).kv_norm))   // ML4 KV-sharing layer: no kv_a / kv_norm of its own (append_kv returns)
++#else
++#define G6A_KV_IN(a) ((a).kv_a&&(a).kv_norm)
++#endif
+ extern "C" int g6a_append(const G6Attn* a,void* s){
+-    if(!a||!ga::valid(*a)||!a->kv_a||!a->kv_norm||!a->mla_cache||!a->positions||!a->block_table||!a->error)return (int)cudaErrorInvalidValue;
++    if(!a||!ga::valid(*a)||!G6A_KV_IN(*a)||!a->mla_cache||!a->positions||!a->block_table||!a->error)return (int)cudaErrorInvalidValue;
+     cudaStream_t stream=(cudaStream_t)s;ga::append_kv<<<a->rows,256,0,stream>>>(*a);
+     if(!a->reuse_indices){if(!a->index_k||!a->index_norm||!a->index_bias||!a->index_cache)return (int)cudaErrorInvalidValue;ga::append_index<<<a->rows,128,0,stream>>>(*a);}
+     return (int)cudaGetLastError();
+@@ -1084,7 +1118,7 @@ extern "C" int g6a_replay_run(const G6AttnReplay* r,void* s){
+     const G6Attn& a=r->fixed;
+ #endif
+     if(!ga::valid(a)||!r->scratch||!a.q_b||!a.uk||!a.uv||!a.indices||!a.output||
+-       !a.kv_a||!a.kv_norm||!a.mla_cache||!a.positions||!a.block_table||!a.error)
++       !G6A_KV_IN(a)||!a.mla_cache||!a.positions||!a.block_table||!a.error)
+         return (int)cudaErrorInvalidValue;
+     if(!a.reuse_indices&&(!a.index_q||!a.index_weight||!a.index_k||!a.index_norm||!a.index_bias||!a.index_cache))return (int)cudaErrorInvalidValue;
+     if(a.reuse_row_map&&a.reuse_indices==a.indices)return (int)cudaErrorInvalidValue;
+@@ -1167,6 +1201,12 @@ extern "C" int g6a_cp_finish(const G6Attn* a,const G6AttnStepCell* cell,void* sc
+     cudaStream_t stream=(cudaStream_t)s;
+     return cp_call(a,cell,scratch,bytes,[&](auto in,ga::Work& w){return ga::cp_finish_body(*a,in,w,part_all,stream);});
+ }
++#if G6_MODEL_ML4
++// the 32 LeRoPE x YaRN frequencies (fp32, G.rope_freq of the pack) into the attention kernels' table; once, before any step
++extern "C" int g6a_ml4_rope(const float* f32,void* stream){
++    return (int)cudaMemcpyToSymbolAsync(ga::g_ml4_freq,f32,32*sizeof(float),0,cudaMemcpyDefault,(cudaStream_t)stream);   // host or device f32
++}
++#endif
+ extern "C" int g6a_cp_groups_ok(int gh){return gh>0&&gh%16==0&&ga::attn_flip_min()<0;}
+ // prob, parts, ml of cp_groups_body, each 256-B aligned
+ static size_t cp_groups_at(int heads,int rows,int k){
+diff --git a/engine/attn/attn.h b/engine/attn/attn.h
+index d7226ce..0c2b533 100644
+--- a/engine/attn/attn.h
++++ b/engine/attn/attn.h
+@@ -47,6 +47,12 @@ struct G6Attn {
+     int reuse_rows;
+     void *output;                 // fp16 [rows,heads,256]
+     unsigned *error;              // initialize to zero before a step; asynchronous device diagnostics
++#if G6_MODEL_ML4
++    int no_rope;                  // ML4 NoPE layer (geom::rope): the indexer rotates neither its query nor its keys (the
++                                  // MLA rope lanes are zero on such layers, so the main attention needs no flag)
++    int kv_shared;                // ML4 layer whose latent is another layer's (geom::kv_src): it never appends; mla_cache is
++                                  // the source binding's (g6a_ml4_bind_kv_alias), and it owns no MLA cache bytes
++#endif
+ #if G6_MODEL_FLASH
+     // kpool indexer (attn/flash_attn.cu): the pool gate projection of the rows, FP16 [rows,128] = x @ compress_gate^T,
+     // and the pool position bias, BF16 [4,128] (index_kpool_compress_ape). indices is [rows,g6kv::SEL] (kvfmt.h).
+@@ -86,6 +92,14 @@ struct G6Attn {
+ };
+ // Remote rows, GR8_RT_FMT=int4 (runtime/rt_rows.cuh): n FP8 rows -> INT4 rows (spill) and back (tests); warp per row,
+ // strides in bytes. cudaErrorNotSupported in a G6_KV4 build, whose rows are INT4 already.
++#if G6_MODEL_ML4
++struct G6AttnBinding;
++// ML4: a KV-sharing layer's binding reads the source layer's MLA cache (same pages, same block table); call after both
++// are created, before any step. Fails unless b is kv_shared and src owns its latent.
++extern "C" int g6a_ml4_bind_kv_alias(G6AttnBinding* b,const G6AttnBinding* src);
++// the 32 LeRoPE x YaRN frequencies (fp32) into the attention kernels' rope table (attn.cu); once, before any step
++extern "C" int g6a_ml4_rope(const float* f32,void* stream);
++#endif
+ extern "C" int g6a_rt_pack_int4(const void* src,size_t src_stride,void* dst,size_t dst_stride,int n,void* stream);
+ extern "C" int g6a_rt_unpack_int4(const void* src,size_t src_stride,void* dst,size_t dst_stride,int n,void* stream);
+ extern "C" size_t g6a_scratch_bytes(const G6Attn*);
+diff --git a/engine/attn/bind.cu b/engine/attn/bind.cu
+index 1dca94b..aafa1d8 100644
+--- a/engine/attn/bind.cu
++++ b/engine/attn/bind.cu
+@@ -98,9 +98,14 @@ extern "C" int g6a_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
+     const int h = g6nr::width(g6nr::HEADS, group);
+     const bool full = geom::full_index(layer);
+     const bool fp8 = p->uks.data || p->uvs.data;   // #50: E4M3 UK / UV with block scales
++#if G6_MODEL_ML4
++    const bool kv_shared = !geom::owns_kv(layer);   // reads layer geom::kv_src(layer)'s latent: no kv_a, no kv_a_norm
++#else
++    const bool kv_shared = false;
++#endif
+     if (!shape(p->uk, {h,192,512}) || !shape(p->uv, {h,256,512}) ||
+         (fp8 && (!shape(p->uks, {h,192,4}) || !shape(p->uvs, {h,256,4}))) ||
+-        !shape(p->kv_norm, {512}) ||
++        (!kv_shared && !shape(p->kv_norm, {512})) ||
+         (full && (!shape(p->index_norm, {128}) || !shape(p->index_bias, {128})))) return invalid;
+ 
+     G6AttnBinding b{};
+@@ -124,6 +129,9 @@ extern "C" int g6a_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
+     }
+ #endif
+     a.query_tile = query_tile;
++#if G6_MODEL_ML4
++    a.no_rope = !geom::rope(layer); a.kv_shared = kv_shared;
++#endif
+     a.kv_norm = p->kv_norm.data; a.uv = p->uv.data; a.uvs = fp8 ? (const float*)p->uvs.data : nullptr;
+     a.index_norm = full ? p->index_norm.data : nullptr;
+     a.index_bias = full ? p->index_bias.data : nullptr;
+@@ -140,7 +148,7 @@ extern "C" int g6a_bind_create_ext(G6AttnBinding* out, const G6AttnPack* p,
+     auto take = [&](size_t n) { size_t at = used; used = (used + n + 255) & ~size_t(255); return at; };
+     const size_t uk = take((size_t)h * 512 * 192 * (fp8 ? 1 : 2));
+     const size_t uks = take(fp8 ? (size_t)h * 4 * 192 * sizeof(float) : 0);
+-    const size_t kv = take((size_t)a.page_count * 64 * g6kv::ROW);
++    const size_t kv = take(kv_shared ? 0 : (size_t)a.page_count * 64 * g6kv::ROW);   // ML4 KV-sharing: the source's cache
+     // Shared layers never append/index their own indexer cache. Index keys sit on the same pages as the latent (under
+     // CP: the replicated prefix and this rank's pages past R), so the index cache has the latent's page count.
+     const int ix_pages = a.page_count;
+@@ -251,3 +259,12 @@ extern "C" int g6a_bind_release(G6AttnBinding* b) {
+     if (e == cudaSuccess) *b = G6AttnBinding{};
+     return (int)e;
+ }
++#if G6_MODEL_ML4
++extern "C" int g6a_ml4_bind_kv_alias(G6AttnBinding* b,const G6AttnBinding* src){
++    if (!b || !src || !b->storage || !src->storage || !b->args.kv_shared || src->args.kv_shared ||
++        geom::kv_src(b->layer) != src->layer || b->args.page_count != src->args.page_count ||
++        b->args.table_size != src->args.table_size) return (int)cudaErrorInvalidValue;
++    b->args.mla_cache = src->args.mla_cache;
++    return 0;
++}
++#endif
+diff --git a/engine/attn/decode-small.cuh b/engine/attn/decode-small.cuh
+index 5603e3e..175f5a7 100644
+--- a/engine/attn/decode-small.cuh
++++ b/engine/attn/decode-small.cuh
+@@ -583,7 +583,7 @@ static bool attn_p11(){
+ // launch_context_parts reaches launch_ctx3 (no FLIP, the head-batched kernels, no P11, use_ctx3); 256 otherwise. run_body
+ // passes it to launch_context_parts and merges TOP/sp partials; the CP calls keep 256 (their merges assume PART).
+ static int ctx_sp(const G6Attn& a,int n){
+- #if G6_KV4
++ #if G6_KV4 || G6_MODEL_ML4
+  (void)a;(void)n;return 256;
+  #else
+  return attn_ctx3_sp()&&!use_attn_flip(a,n)&&attn_heads()&&!attn_p11()&&use_ctx3(a)?attn_ctx3_sp():256;
+@@ -631,6 +631,10 @@ static void launch_context_tile(const G6Attn& a,Input input,Work& w,int start,in
+ // index and contexts past 2048 included.
+ template<class Input>   // qt: run_body only (attn.cu use_qt, which implies the scores_sc branch below)
+ static void launch_mla_scores(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st,bool qt=false){
++ #if G6_MODEL_ML4   // the FP16 ML4 row (kvfmt.h): the generic kernel (latent() / rope_key()); the FP8 variants below read E4M3
++ (void)qt;mla_scores<<<dim3(TOP/8,a.heads,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);
++ return;
++ #endif
+  #if G6_KV4   // the INT4 row has the head-batched kernel and the generic one; the FP8-only variants below are not used
+  if(attn_heads()){constexpr int HG=16;kv4::scores_heads<HG><<<dim3(TOP/8,(a.heads+HG-1)/HG,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);}
+  else mla_scores<<<dim3(TOP/8,a.heads,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);
+@@ -647,6 +651,10 @@ static void launch_mla_scores(const G6Attn& a,Input input,Work& w,int start,int
+ // sp (run_body, ctx_sp): context_pk3's slots per partition; 256 = PART partitions (every other caller)
+ template<class Input>
+ static void launch_context_parts(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st,int sp=256){
++ #if G6_MODEL_ML4   // the FP16 ML4 row: the generic kernel (latent())
++ (void)sp;context_parts<<<dim3(PART,a.heads,n),256,0,st>>>(input,start,w.prob,w.parts);
++ return;
++ #endif
+  #if G6_KV4
+  if(!attn_heads())context_parts<<<dim3(PART,a.heads,n),256,0,st>>>(input,start,w.prob,w.parts);
+  else if(n>=5){constexpr int HG=8;kv4::context_parts_heads<HG><<<dim3(PART*2,(a.heads+HG-1)/HG,n),128,0,st>>>(input,start,w.prob,w.parts);}
+diff --git a/engine/attn/kvfmt.h b/engine/attn/kvfmt.h
+index e4dc665..8da208e 100644
+--- a/engine/attn/kvfmt.h
++++ b/engine/attn/kvfmt.h
+@@ -70,6 +70,14 @@ constexpr int IDX_ROW = IDX_PAGE / PAGE;                    // 128 per token (si
+ constexpr int RAW_RING = 64, RAW_SESS = 8;                  // the raw ring: positions a session, sessions (S2N)
+ constexpr int RAW_BYTES = RAW_SESS * RAW_RING * IDX_RAW;    // 256 KB a binding
+ constexpr int SEL = 2304;   // selected positions per row: TOP_POOLS * KPOOL + the tail (<= 3), padded to 9 x 256
++#elif G6_MODEL_ML4
++// Mistral Large 4 (GLM's attention core, the recipe's docs/PORT.md): [512 FP16 latent][64 FP16 rope] = 1152 B, the
++// baseline's precision (an E4M3 latent puts attention outputs ~1e-2 off the reference). No scales (SCALE_OFF unused).
++#if G6_KV4
++#error "G6_MODEL_ML4 keeps the FP16 latent row (G6_KV4 is GLM's INT4 row)"
++#endif
++constexpr int ROW = 1024 + 2 * geom::QK_ROPE, SCALE_OFF = 0, ROPE_OFF = 1024;
++constexpr const char* NAME = "f16ml4";
+ #elif G6_KV4
+ constexpr int ROW = 288 + 2 * geom::QK_ROPE, SCALE_OFF = 256, ROPE_OFF = 288;
+ constexpr const char* NAME = "int4g32h";
+diff --git a/engine/kernels/bind.cuh b/engine/kernels/bind.cuh
+index 3e19fe4..f1856f6 100644
+--- a/engine/kernels/bind.cuh
++++ b/engine/kernels/bind.cuh
+@@ -90,6 +90,9 @@ enum
+     T_TR3_SG, T_TR3_V1B, T_TR3_V3B,                                     // exlr8 v2 layers with the trellis shared expert: hidden-
+                                                                         // side vectors as signs + block scales (no tr3.v1 / v3)
+     T_Q_B_I4,                                                           // exlr8 int4 g32 q_b (layers where int4 won the encode)
++#if G6_MODEL_ML4
++    T_ML4_KV_A, T_ML4_IDX_WQ_B, T_ML4_IDX_WK, T_ML4_IDX_WPROJ, T_ML4_ROUTER,  // Mistral Large 4: F16W records (tools ml4_pack.py)
++#endif
+     NT
+ };
+ static const char* const NAMES[NT] = {
+@@ -97,7 +100,11 @@ static const char* const NAMES[NT] = {
+     "shared.gptq.fc1", "shared.gptq.fc2", "dense.gptq.fc1", "dense.gptq.fc2",
+     "tr3.fc1", "tr3.fc2", "tr3.v1", "tr3.v2", "tr3.v3", "tr3.table",
+     "q_a.mx.gv", "o_proj.mx.gv", "shared.gate.mx.gv", "shared.up.mx.gv", "shared.down.mx.gv", "tr3.kmix", "tr3.sg", "tr3.v1b",
+-    "tr3.v3b", "q_b.gptq"};
++    "tr3.v3b", "q_b.gptq"
++#if G6_MODEL_ML4
++    , "kv_a.f16.gv", "idx.wq_b.f16.gv", "idx.wk.f16.gv", "idx.weights_proj.f16.gv", "router.f16.gv"
++#endif
++};
+ 
+ struct LayerTensors
+ {
+@@ -1155,6 +1162,11 @@ struct Io                             // step buffers of one rank; device memory
+     float* logits = nullptr;          // out [8][256] fp32 router logits (MoE layers)
+     PlanPtrs plan;                    // in  route plan written by glue::k_router_plan (MoE layers)
+     void* mlp_part = nullptr;         // out [8][6144] BF16   MLP partial
++#if G6_MODEL_ML4
++    __half* q_raw = nullptr;          // out [M][H*128] wq (dtr), before ml4::qprep writes q_b in GLM's layout
++    const __half* x_ln = nullptr;     // in  [M][6144] the indexer's LayerNorm of x (ml4::ln; its fragments in xf_qa)
++    const __half* attn_c = nullptr;   // in  [M][H*128] the attention output compacted to 128 value dims (ml4::compact)
++#endif
+ };
+ 
+ struct Layer
+@@ -1237,8 +1249,64 @@ inline void warm_proj(const Layer& next, cudaStream_t st, int more = 0)
+ // fuse = 1: the routed and shared fc1 + fc2 as one persistent launch (K1::fuse, k1_tr3_fused); same bytes out.
+ // fuse = 2: the same launch with the 4-partial fc1 split at M = 2, 3 (other bytes there, see make_k1).
+ // split_m: as make_k1 (0 = the split of M rows)
++#if G6_MODEL_ML4
++// Mistral Large 4 (the recipe's docs/PORT.md sections 5-6): no q_a; wq and wo as dense trellis K3 mul1 (dtr format 1),
++// wq on x (the attention norm output) into io.q_raw (ml4::qprep then writes q_b in GLM's layout), wo on io.attn_c;
++// kv_a (absent on KV-sharing layers), the indexer's wk / weights_proj and the router as F16W on fp16 fragments of x / x2,
++// the indexer's wq_b as F16W on the fragments of x_ln (its LayerNorm; the q_a slot's table, xf_qa). Layer 0's dense MLP
++// as dtr GLU + down; MoE layers K1 with the shared expert as routed row 128 (k_router_plan_ml4).
++inline const char* make_layer_ml4(const LayerTensors& T, int M, const Scratch& sc, const Io& io, Layer& L, int fuse, int split_m)
++{
++    L = Layer();
++    if (M < 1 || M > G6_MX) return "M must be 1..G6_MX (8, or 32 under DEC_S2)";
++    L.M = M;
++    L.moe = T.t[T_TR3_TAB].p != nullptr;
++    L.indexer = T.t[T_ML4_IDX_WQ_B].p != nullptr;
++    if (T.mats_err) return T.mats_err;
++    const dtr::LayerMats& D = T.mats;
++    if (!D.q_b.w || !D.o_proj.w) return "ML4 layer without its wq / wo trellis matrices (Lnnn.q_b.*, Lnnn.o_proj.*)";
++    if (D.q_b.fmt != 1 || D.o_proj.fmt != 1) return "ML4 wq / wo are not K3 mul1 (dtr format 1)";
++    const char* e = nullptr;
++    //                 tensor                 codec  tpc ks  M  fragments  output      dtype
++    if ((e = make_gv(T.t[T_ML4_KV_A],      F16W, 2,  16, M, sc.xf_x,   io.kv_a,    gv::O_F16, L.kv_a))) return e;
++    if ((e = make_gv(T.t[T_ML4_IDX_WQ_B],  F16W, 1,  32, M, sc.xf_qa,  io.idx_q,   gv::O_F16, L.idx_q))) return e;
++    if ((e = make_gv(T.t[T_ML4_IDX_WK],    F16W, 1,  32, M, sc.xf_x,   io.idx_k,   gv::O_F16, L.idx_k))) return e;
++    if ((e = make_gv(T.t[T_ML4_IDX_WPROJ], F16W, 1,  32, M, sc.xf_x,   io.idx_w,   gv::O_F16, L.idx_w))) return e;
++    const int rtpc = static_cast<int>(knob::router_tpc());
++    if ((e = make_gv(T.t[T_ML4_ROUTER],    F16W, rtpc, 16, M, sc.xf_x2, io.logits, gv::O_F32, L.router))) return e;
++    if (L.moe != L.router.on) return "ML4: router.f16.gv and tr3.table must come together";
++    if (L.indexer != (L.idx_k.on && L.idx_w.on)) return "ML4: an indexer layer needs idx.wq_b, idx.wk and idx.weights_proj";
++    if (D.q_b.K != HID || D.o_proj.N != HID || D.o_proj.K != D.q_b.N || D.q_b.N % 128 || D.q_b.N > g6nr::HMAX * 128)
++        return "ML4 attention projection shapes do not chain (wq 6144 -> heads * 128 = wo's input)";
++    if (L.kv_a.on && (L.kv_a.K != HID || L.kv_a.O != geom::KVA)) return "ML4 kv_a.f16.gv is not [576 <- 6144]";
++    L.heads = D.q_b.N / 128;
++    if ((e = dtr::make_out(D.q_b, M, io.x, HID, nullptr, io.q_raw, D.q_b.N, dtr::O_F16, sc.dt, 0, 0, 1, L.q_b_t))) return e;
++    if ((e = dtr::make_out(D.o_proj, M, io.attn_c, D.o_proj.K, nullptr, io.attn_part, HID, dtr::O_BF16, sc.dt, 64, 0, 1, L.o_proj_t)))
++        return e;
++    L.xf_x.on = 1;  L.xf_x.src = io.x;     L.xf_x.ld = HID;  L.xf_x.K = HID;  L.xf_x.f16 = sc.xf_x;   L.xf_x.bf16 = nullptr;
++    L.xf_qa.on = L.indexer; L.xf_qa.src = io.x_ln; L.xf_qa.ld = HID; L.xf_qa.K = HID; L.xf_qa.f16 = sc.xf_qa; L.xf_qa.bf16 = nullptr;
++    L.xf_attn.on = 0;   // wo (dtr) rotates its own input
++    L.xf_x2.on = 1; L.xf_x2.src = io.x2;   L.xf_x2.ld = HID; L.xf_x2.K = HID; L.xf_x2.f16 = sc.xf_x2; L.xf_x2.bf16 = nullptr;
++    L.xf_x.M = L.xf_qa.M = L.xf_attn.M = L.xf_x2.M = M;
++    if (D.gate.w)
++    {
++        if (L.moe) return "ML4: dense trellis MLP tensors in a MoE layer";
++        if (D.gate.fmt != 1 || D.down.fmt != 1) return "ML4 dense MLP is not K3 mul1 (dtr format 1)";
++        if (D.gate.N > g6nr::DENSE_CH || D.gate.N % 128) return "ML4 dense MLP width is not 128-blocks within DENSE_CH";
++        if ((e = dtr::make_glu(D.gate, D.up, D.down, M, io.x2, HID, sc.dxd, sc.dt, 128, 0, 1, L.glu_t))) return e;
++        if ((e = dtr::make_out(D.down, M, nullptr, 0, sc.dxd, io.mlp_part, HID, dtr::O_BF16, sc.dt, 192, 0, 1, L.down_t))) return e;
++        L.xf_x2.on = 0;
++    }
++    else if ((e = make_k1(T, M, sc, io.x2, sc.xf_x2, io.plan, io.mlp_part, 1, L.k1, L.sh, fuse, split_m))) return e;
++    return nullptr;
++}
++#endif
++
+ inline const char* make_layer(const LayerTensors& T, int M, const Scratch& sc, const Io& io, Layer& L, int fuse = 0, int split_m = 0)
+ {
++#if G6_MODEL_ML4
++    return make_layer_ml4(T, M, sc, io, L, fuse, split_m);
++#endif
+     L = Layer();
+     if (M < 1 || M > G6_MX) return "M must be 1..G6_MX (8, or 32 under DEC_S2)";
+     L.M = M;
+@@ -1331,7 +1399,11 @@ struct HeadTensors
+ template <class F> inline HeadTensors head_tensors(F find)
+ {
+     HeadTensors T;
++#if G6_MODEL_ML4
++    T.lm_head = find("G.lm_head.f16.gv");   // the 6-bit head dequantized to fp16 (tools ml4_pack.py), F16W
++#else
+     T.lm_head = find("G.lm_head.mx.gv");
++#endif
+     T.eh = find(G6_MTP_L ".eh.mx.gv");
+     return T;
+ }
+@@ -1371,7 +1443,11 @@ inline const char* make_head(const HeadTensors& T, int rank, int M, const Scratc
+     H.M = M;
+     const char* e = nullptr;
+     // best split on the GB10 (engine/results/item2-gv.jsonl): lm_head_rank tpc 1 ks 32, mtp_eh tpc 2 ks 16
++#if G6_MODEL_ML4
++    if ((e = make_gv(T.lm_head, F16W, 1, 32, M, sc.xf_head, io.logits, gv::O_F32, H.lm_head))) return e;
++#else
+     if ((e = make_gv(T.lm_head, MXFP8, 1, 32, M, sc.xf_head, io.logits, gv::O_F32, H.lm_head))) return e;
++#endif
+     if ((e = make_gv(T.eh,      MXFP8, 2, 16, M, sc.xf_eh,   io.eh,     gv::O_F16, H.eh))) return e;
+     if (!H.lm_head.on) return "no G.lm_head.mx.gv";
+     if (H.lm_head.K != HID || H.lm_head.O != H.vn) return "G.lm_head.mx.gv is not this rank's [vn/16][192][528] vocab slice";
+diff --git a/engine/kernels/bind_prefill.cuh b/engine/kernels/bind_prefill.cuh
+index f8332e9..aafda87 100644
+--- a/engine/kernels/bind_prefill.cuh
++++ b/engine/kernels/bind_prefill.cuh
+@@ -5324,6 +5324,11 @@ template <bool RS = false, bool SHX = false, bool CUT = false> __global__ void _
+ 
+ inline void launch_route_rows(const Expert& A, cudaStream_t st)     // logits -> tok_e, tok_w of the A.M rows of A
+ {
++#if G6_MODEL_ML4   // ML4 routes by softmax top-4 + the shared row (glue::k_router_plan_ml4); the prefill router is not ported yet
++    (void)A; (void)st;
++    fprintf(stderr, "ML4: the prefill router (k_pf_route) is not ported; run the prompt through the decode path\n");
++    abort();
++#else
+     switch (A.topk)                 // GR8_MOE_TOPK cut: one instance per K; K = TOPK is the pre-cut kernel
+     {
+         case 1: k_pf_route<1><<<(A.M + 7) / 8, 256, 0, st>>>(A); break;
+@@ -5337,6 +5342,7 @@ inline void launch_route_rows(const Expert& A, cudaStream_t st)     // logits ->
+ #endif
+         default: k_pf_route<TOPK><<<(A.M + 7) / 8, 256, 0, st>>>(A); break;
+     }
++#endif
+ }
+ // GR8_PF_ROUTER_SPLIT: route rows [r0, r0 + rows) only, from logits / tok_e / tok_w of the same rows (the pointers are per-row
+ // views of the full tables, so a row's bytes are those of the whole-M launch)
+diff --git a/engine/kernels/glue.cuh b/engine/kernels/glue.cuh
+index 1e10958..a6ccb92 100644
+--- a/engine/kernels/glue.cuh
++++ b/engine/kernels/glue.cuh
+@@ -581,8 +581,13 @@ struct RoutePlan
+ // K (template) = routed experts kept per token (GR8_MOE_TOPK cut; default TOPK = the model's): the sum renormalizes over
+ // the K kept, and routes k >= K carry the plan's no-route encoding (tok_slot -1), which the K1 consumers already skip.
+ // K = TOPK compiles to the pre-cut source (same init loop, same unrolls): the OFF instance is SASS-identical to a5edf0a.
+-constexpr int RW = NEXP / 32;   // k_router_plan warps; each lane holds RW experts in the top-k
+-static_assert(NEXP % 32 == 0 && RW <= 32, "k_router_plan: one thread per expert, one taken bit per lane expert");
++#if G6_MODEL_ML4
++constexpr int NEXP_R = geom::NEXP_ROUTED;   // ML4: NEXP counts the shared expert's table row (128); the router picks of 128
++#else
++constexpr int NEXP_R = NEXP;
++#endif
++constexpr int RW = NEXP_R / 32;   // k_router_plan warps; each lane holds RW experts in the top-k
++static_assert(NEXP_R % 32 == 0 && RW <= 32, "k_router_plan: one thread per expert, one taken bit per lane expert");
+ template <int K = TOPK> __global__ void __launch_bounds__(NEXP) k_router_plan(const float* logits, const float* bias, int M, RoutePlan* P,
+                                                                                    unsigned keep = 0u, const unsigned* keep_dev = nullptr)
+ {
+@@ -821,6 +826,137 @@ template <int K = TOPK> __global__ void __launch_bounds__(NEXP) k_router_plan(co
+     }
+ }
+ 
++#if G6_MODEL_ML4
++// ---------------------------------------------------------------- router: Mistral Large 4 (softmax top-4 + shared row)
++// transformers MistralLarge4TextTopkRouter + MistralLarge4TextMoE, n_group 1, routed scaling 1.0: logits [M][128] fp32
++// (the gate GEMV), p = softmax(logits); the top 4 by p (= by logit; ties -> lowest expert id); weight_k = p_k / (sum of
++// the 4 + 1e-20) = exp(l_k - l_1) / sum_j exp(l_j - l_1) over the 4 (the softmax's denominator cancels; the 1e-20 is
++// far below the sum's fp32 ulp, which is >= 4/128). The shared expert is the table's row 128 (tools/ml4_pack.py): every
++// token takes it as route 4 with weight 1, so K1 adds it as it adds a routed expert (finalize sums all 8 routes).
++// The plan is GLM's (k_router_plan above): slots in ascending expert id, M <= 8 one slot per expert with column = token,
++// M > 8 ceil(n / 8) slots of an expert's tokens in ascending order. grid 1, block 160 (5 warps: warps 0-3 select, thread
++// e < 129 = expert e for the slots).
++constexpr int ML4_RT = 160, ML4_K = TOPK + 1;
++static_assert(NEXP == NEXP_R + 1 && NEXP <= ML4_RT && RW == 4, "k_router_plan_ml4: 128 routed experts + the shared row (ML4_BENCH_NEXP=129)");
++__global__ void __launch_bounds__(ML4_RT) k_router_plan_ml4(const float* logits, int M, RoutePlan* P)
++{
++    __shared__ unsigned emask[NEXP];
++    __shared__ int sel_e[MMAX][ML4_K];
++    __shared__ float sel_w[MMAX][ML4_K];
++    __shared__ int slot_of[NEXP];
++    __shared__ int wcount[ML4_RT / 32];
++    const int t = threadIdx.x, w = t >> 5, l = t & 31;
++    const bool dense = M > 8;
++    if (t < NEXP) emask[t] = t == NEXP_R ? (M >= 32 ? 0xffffffffu : (1u << M) - 1u) : 0u;
++    for (int i = t; i < SMAX * 8; i += ML4_RT) { (&P->slot_w[0][0])[i] = 0.f; (&P->slot_tok[0][0])[i] = -1; }
++    for (int i = t; i < MMAX * 8; i += ML4_RT)
++    {
++        const int m = i >> 3, k = i & 7;
++        P->tok_slot[m][k] = -1; P->tok_col[m][k] = 0; P->tok_w[m][k] = 0.f; P->tok_expert[m][k] = -1;
++    }
++    __syncthreads();
++    if (w < RW)
++        for (int m = w; m < M; m += RW)
++        {
++            float key[RW];
++            #pragma unroll
++            for (int i = 0; i < RW; ++i) key[i] = logits[m * NEXP_R + l + 32 * i];
++            unsigned taken = 0;
++            float my_k = key[0];
++            int my_e = l;
++            #pragma unroll
++            for (int i = 1; i < RW; ++i)
++                if (key[i] > my_k) { my_k = key[i]; my_e = l + 32 * i; }
++            float top[TOPK];
++            for (int k = 0; k < TOPK; ++k)
++            {
++                float bk = my_k;
++                int be = my_e;
++                #pragma unroll
++                for (int o = 16; o > 0; o >>= 1)
++                {
++                    const float ok = __shfl_xor_sync(0xffffffffu, bk, o);
++                    const int oe = __shfl_xor_sync(0xffffffffu, be, o);
++                    if (ok > bk || (ok == bk && oe < be)) { bk = ok; be = oe; }
++                }
++                top[k] = bk;
++                if (l == 0) sel_e[m][k] = be;
++                if ((be & 31) == l)
++                {
++                    taken |= 1u << (be >> 5);
++                    my_k = -INFINITY;
++                    my_e = 0x7fffffff;
++                    #pragma unroll
++                    for (int i = 0; i < RW; ++i)
++                        if (!(taken >> i & 1) && key[i] > my_k) { my_k = key[i]; my_e = l + 32 * i; }
++                }
++            }
++            float ex[TOPK], sum = 0.f;
++            #pragma unroll
++            for (int k = 0; k < TOPK; ++k) { ex[k] = expf(top[k] - top[0]); sum += ex[k]; }
++            __syncwarp();
++            if (l < TOPK)
++            {
++                float wv = ex[0];
++                #pragma unroll
++                for (int k = 1; k < TOPK; ++k) if (l == k) wv = ex[k];
++                sel_w[m][l] = wv / sum * ROUTE_SCALE;
++                atomicOr(&emask[sel_e[m][l]], 1u << m);
++            }
++            if (l == TOPK) { sel_e[m][TOPK] = NEXP_R; sel_w[m][TOPK] = 1.f; }
++            __syncwarp();
++        }
++    __syncthreads();
++    // thread t = expert t: cnt tokens -> ceil(cnt / 8) slots (one when M <= 8); first slot = exclusive prefix over experts
++    const unsigned em = t < NEXP ? emask[t] : 0u;
++    const int nsl = dense ? (__popc(em) + 7) >> 3 : (em != 0u);
++    int scan = nsl;
++    #pragma unroll
++    for (int o = 1; o < 32; o <<= 1)
++    {
++        const int v = __shfl_up_sync(0xffffffffu, scan, o);
++        if (l >= o) scan += v;
++    }
++    if (l == 31) wcount[w] = scan;
++    __syncthreads();
++    int base = 0;
++    #pragma unroll
++    for (int i = 0; i < ML4_RT / 32; ++i) if (i < w) base += wcount[i];
++    const int slot0 = base + scan - nsl;
++    if (nsl)
++    {
++        slot_of[t] = slot0;
++        const int cnt = __popc(em);
++        for (int j = 0; j < nsl; ++j)
++        {
++            P->slot_expert[slot0 + j] = t;
++            P->slot_mask[slot0 + j] = dense ? static_cast<int>((1u << (cnt - 8 * j < 8 ? cnt - 8 * j : 8)) - 1u) : static_cast<int>(em);
++        }
++    }
++    if (t == 0)
++    {
++        int n = 0;
++        #pragma unroll
++        for (int i = 0; i < ML4_RT / 32; ++i) n += wcount[i];
++        P->n_slots = n;
++    }
++    __syncthreads();
++    for (int i = t; i < M * ML4_K; i += ML4_RT)
++    {
++        const int m = i / ML4_K, k = i % ML4_K;
++        const int e = sel_e[m][k];
++        const int r = __popc(emask[e] & ((1u << m) - 1u));      // rank of token m among the expert's tokens
++        const int s2 = slot_of[e] + (dense ? r >> 3 : 0), col = dense ? (r & 7) : m;
++        P->tok_slot[m][k] = s2;
++        P->tok_col[m][k] = col;
++        P->tok_w[m][k] = sel_w[m][k];
++        P->tok_expert[m][k] = e;
++        P->slot_w[s2][col] = sel_w[m][k];
++        P->slot_tok[s2][col] = m;
++    }
++}
++#endif
++
+ // ---------------------------------------------------------------- sampling: Philox4x32-10 + Gumbel-max
+ 
+ __host__ __device__ __forceinline__ uint32_t mulhi32(uint32_t a, uint32_t b)
+diff --git a/engine/kernels/ml4_glue.cuh b/engine/kernels/ml4_glue.cuh
+new file mode 100644
+index 0000000..fb511ab
+--- /dev/null
++++ b/engine/kernels/ml4_glue.cuh
+@@ -0,0 +1,101 @@
++// Mistral Large 4 glue around gr8's GLM attention core (docs/PORT.md section 6 of the recipe): ML4 is presented to the
++// core in GLM's attention shape. Our own code; G6_MODEL_ML4 builds only.
++//
++//   k_ml4_qprep    q_raw [M][Hr][128] fp16 (wq, dtr) -> q_b [M][Hr][256] fp16 in GLM's layout [192 nope | 64 rope]:
++//                  f = (s_h ln(pos + 1) + b_h) * sqrt(2)   (ssmax; sqrt(2) turns the core's 256^-0.5 into 128^-0.5)
++//                  rope layers: nope [0, 64) = f q[0, 64), [64, 192) = 0, rope [192, 256) = f q[64, 128)
++//                  NoPE layers: nope [0, 128) = f q[0, 128), [128, 256) = 0
++//                  (transformers applies ssmax after rope; one scalar per head and row commutes with the rotation)
++//   k_ml4_ln       y = LayerNorm(x) w + b (eps 1e-6, fp32 statistics), fp16 out: the indexer's q_input_norm
++//   k_ml4_ssmax    in place on [M][NH][D] fp16: v *= s_h ln(pos + 1) + b_h (the indexer's ssmax, 32 heads of 128)
++//   k_ml4_compact  attn [M][Hr][256] fp16 (the core's output, value dims 128-255 zero) -> [M][Hr * 128] for wo
++//   k_ml4_softcap  in place on the head's fp32 logits [M][ld] (vn used): 30 tanh(x / 30) (final_logit_softcapping)
++#pragma once
++#include <cuda_fp16.h>
++#include "../model_geom.h"
++
++namespace ml4
++{
++// grid (Hr, M), block 128
++__global__ void __launch_bounds__(128) k_ml4_qprep(const __half* q_raw, const int* pos, const float* ss, int h0, int hr, int rope,
++                                                   __half* q_b)
++{
++    const int h = blockIdx.x, m = blockIdx.y, t = threadIdx.x, hg = h0 + h;
++    const float f = (ss[hg] * logf(static_cast<float>(pos[m]) + 1.f) + ss[64 + hg]) * 1.41421356237309515f;
++    const __half* q = q_raw + (static_cast<size_t>(m) * hr + h) * 128;
++    __half* o = q_b + (static_cast<size_t>(m) * hr + h) * 256;
++    const float v = __half2float(q[t]) * f;
++    if (rope)
++    {
++        if (t < 64) { o[t] = __float2half_rn(v); o[64 + t] = __float2half_rn(0.f); }
++        else { o[192 + t - 64] = __float2half_rn(v); o[64 + t] = __float2half_rn(0.f); }   // t >= 64: zero [128, 192)
++    }
++    else
++    {
++        o[t] = __float2half_rn(v);
++        o[128 + t] = __float2half_rn(0.f);
++    }
++}
++inline void qprep(const __half* q_raw, const int* pos, const float* ss, int h0, int hr, int rope, __half* q_b, int M, cudaStream_t st)
++{
++    k_ml4_qprep<<<dim3(hr, M), 128, 0, st>>>(q_raw, pos, ss, h0, hr, rope, q_b);
++}
++
++// grid M, block 256; K = 6144
++__global__ void __launch_bounds__(256) k_ml4_ln(const __half* x, int ldx, const float* wb, int K, __half* y, int ldy)
++{
++    const int m = blockIdx.x, t = threadIdx.x;
++    const __half* xr = x + static_cast<size_t>(m) * ldx;
++    __shared__ float red[2][8];
++    float s = 0.f;
++    for (int k = t; k < K; k += 256) s += __half2float(xr[k]);
++    for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(0xffffffffu, s, o);
++    if ((t & 31) == 0) red[0][t >> 5] = s;
++    __syncthreads();
++    float mean = 0.f;
++    for (int i = 0; i < 8; ++i) mean += red[0][i];
++    mean /= K;
++    float v = 0.f;
++    for (int k = t; k < K; k += 256) { const float d = __half2float(xr[k]) - mean; v += d * d; }
++    for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
++    if ((t & 31) == 0) red[1][t >> 5] = v;
++    __syncthreads();
++    float var = 0.f;
++    for (int i = 0; i < 8; ++i) var += red[1][i];
++    const float r = rsqrtf(var / K + 1e-6f);
++    for (int k = t; k < K; k += 256)
++        y[static_cast<size_t>(m) * ldy + k] = __float2half_rn((__half2float(xr[k]) - mean) * r * wb[k] + wb[K + k]);
++}
++inline void ln(const __half* x, int ldx, const float* wb, int K, __half* y, int ldy, int M, cudaStream_t st)
++{
++    k_ml4_ln<<<M, 256, 0, st>>>(x, ldx, wb, K, y, ldy);
++}
++
++// grid (NH, M), block D
++__global__ void k_ml4_ssmax(__half* v, const int* pos, const float* ss, int nh, int d)
++{
++    const int h = blockIdx.x, m = blockIdx.y, t = threadIdx.x;
++    const float f = ss[h] * logf(static_cast<float>(pos[m]) + 1.f) + ss[nh + h];
++    __half* p = v + (static_cast<size_t>(m) * nh + h) * d + t;
++    *p = __float2half_rn(__half2float(*p) * f);
++}
++inline void ssmax(__half* v, const int* pos, const float* ss, int nh, int d, int M, cudaStream_t st)
++{
++    k_ml4_ssmax<<<dim3(nh, M), d, 0, st>>>(v, pos, ss, nh, d);
++}
++
++// grid (Hr, M), block 128
++__global__ void __launch_bounds__(128) k_ml4_compact(const __half* a, int hr, __half* o)
++{
++    const int h = blockIdx.x, m = blockIdx.y, t = threadIdx.x;
++    o[(static_cast<size_t>(m) * hr + h) * 128 + t] = a[(static_cast<size_t>(m) * hr + h) * 256 + t];
++}
++inline void compact(const __half* a, int hr, __half* o, int M, cudaStream_t st) { k_ml4_compact<<<dim3(hr, M), 128, 0, st>>>(a, hr, o); }
++// grid (ceil(vn / 256), M), block 256
++__global__ void __launch_bounds__(256) k_ml4_softcap(float* y, int ld, int vn, float cap)
++{
++    const int i = blockIdx.x * 256 + threadIdx.x, m = blockIdx.y;
++    if (i < vn) { float* p = y + static_cast<size_t>(m) * ld + i; *p = cap * tanhf(*p / cap); }
++}
++inline void softcap(float* y, int ld, int vn, int M, cudaStream_t st) { k_ml4_softcap<<<dim3((vn + 255) / 256, M), 256, 0, st>>>(y, ld, vn, geom::SOFTCAP); }
++}   // namespace ml4
+diff --git a/engine/kernels/tests/router_ml4_test.cu b/engine/kernels/tests/router_ml4_test.cu
+new file mode 100644
+index 0000000..7aefa53
+--- /dev/null
++++ b/engine/kernels/tests/router_ml4_test.cu
+@@ -0,0 +1,73 @@
++// glue::k_router_plan_ml4 (Mistral Large 4: softmax top-4 of 128 + the shared row 128) against a CPU reference of
++// transformers' MistralLarge4TextTopkRouter, on random logits (ties included) at M = 1, 2, 3, 8, 13, 32 (DEC_S2).
++//   nvcc -O2 -std=c++17 -gencode=arch=compute_121a,code=sm_121a -DG6_NR=4 -DDEC_S2 -DG6_MODEL_ML4=1 -DML4_BENCH_NEXP=129 \
++//        -I.. -o router_ml4_test router_ml4_test.cu
++// Checks per token: the 4 routed experts are the top 4 by logit (ties -> lowest id), weights = softmax over all 128
++// gathered and renormalized (fp64 reference, |d| <= 1e-6), route 4 = expert 128 with weight 1; and the plan's slots:
++// ascending expert id, every (slot, column) points back at its token, n_slots matches.
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <random>
++#include <vector>
++#include "../glue.cuh"
++
++#define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { fprintf(stderr, "%s:%d %s\n", __FILE__, __LINE__, cudaGetErrorString(e_)); return 1; } } while (0)
++
++int main()
++{
++    using namespace glue;
++    std::mt19937 rng(7);
++    std::normal_distribution<float> nd(0.f, 2.f);
++    float* dl;
++    RoutePlan* dp;
++    CK(cudaMalloc(&dl, MMAX * NEXP_R * 4));
++    CK(cudaMalloc(&dp, sizeof(RoutePlan)));
++    int bad = 0;
++    for (int M : {1, 2, 3, 8, 13, MMAX})
++        for (int trial = 0; trial < 20; ++trial)
++        {
++            if (M > MMAX) continue;
++            std::vector<float> lg(M * NEXP_R);
++            for (float& v : lg) v = nd(rng);
++            if (trial % 4 == 1)                     // ties: a few copies of one logit, some among the top
++                for (int m = 0; m < M; ++m) { const float v = lg[m * NEXP_R + 5]; lg[m * NEXP_R + 9] = v; lg[m * NEXP_R + 70] = v + 10; lg[m * NEXP_R + 71] = v + 10; }
++            CK(cudaMemcpy(dl, lg.data(), lg.size() * 4, cudaMemcpyHostToDevice));
++            k_router_plan_ml4<<<1, ML4_RT>>>(dl, M, dp);
++            CK(cudaDeviceSynchronize());
++            RoutePlan P;
++            CK(cudaMemcpy(&P, dp, sizeof P, cudaMemcpyDeviceToHost));
++            int nslot_ref = 0;
++            std::vector<int> cnt(NEXP, 0);
++            for (int m = 0; m < M; ++m)
++            {
++                std::vector<int> id(NEXP_R);
++                for (int e = 0; e < NEXP_R; ++e) id[e] = e;
++                const float* L = &lg[m * NEXP_R];
++                std::stable_sort(id.begin(), id.end(), [&](int x, int y) { return L[x] > L[y]; });
++                double mx = *std::max_element(L, L + NEXP_R), z = 0;
++                for (int e = 0; e < NEXP_R; ++e) z += std::exp((double)L[e] - mx);
++                double top = 0;
++                for (int k = 0; k < TOPK; ++k) top += std::exp((double)L[id[k]] - mx) / z;
++                for (int k = 0; k <= TOPK; ++k)
++                {
++                    const int e = k < TOPK ? id[k] : NEXP_R;
++                    const double w = k < TOPK ? std::exp((double)L[e] - mx) / z / (top + 1e-20) : 1.0;
++                    const int s = P.tok_slot[m][k], c = P.tok_col[m][k];
++                    if (P.tok_expert[m][k] != e || std::fabs(P.tok_w[m][k] - w) > 1e-6 || s < 0 || P.slot_expert[s] != e ||
++                        P.slot_tok[s][c] != m || std::fabs(P.slot_w[s][c] - P.tok_w[m][k]) != 0 || !(P.slot_mask[s] >> c & 1))
++                    {
++                        if (bad++ < 5) fprintf(stderr, "M %d trial %d token %d route %d: expert %d (want %d) w %.8f (want %.8f) slot %d col %d\n",
++                                               M, trial, m, k, P.tok_expert[m][k], e, P.tok_w[m][k], w, s, c);
++                    }
++                    ++cnt[e];
++                }
++                for (int k = TOPK + 1; k < 8; ++k) if (P.tok_slot[m][k] != -1) ++bad;
++            }
++            for (int e = 0; e < NEXP; ++e) nslot_ref += M > 8 ? (cnt[e] + 7) / 8 : (cnt[e] > 0);
++            if (P.n_slots != nslot_ref) { if (bad++ < 5) fprintf(stderr, "M %d: n_slots %d want %d\n", M, P.n_slots, nslot_ref); }
++            for (int s = 1; s < P.n_slots; ++s) if (P.slot_expert[s] < P.slot_expert[s - 1]) ++bad;
++        }
++    printf("router_ml4: %s (%d mismatches)\n", bad ? "FAIL" : "PASS", bad);
++    return bad ? 1 : 0;
++}
+diff --git a/engine/runtime/m4sim.cu b/engine/runtime/m4sim.cu
+index 13306b2..dd0a946 100644
+--- a/engine/runtime/m4sim.cu
++++ b/engine/runtime/m4sim.cu
+@@ -309,6 +309,8 @@ int main(int argc, char** argv)
+     }
+ #elif G6_MODEL_DS41
+     if (knob::moe_topk() != 8) die("GR8_MOE_TOPK is a Flash-model option: DeepSeek-V4.1 reads GR8_DS_MOE_TOPK");
++#elif G6_MODEL_ML4
++    if (knob::moe_topk() != 8) die("GR8_MOE_TOPK is a Flash-model option (ML4 routes its top-4 in glue::k_router_plan_ml4)");   // 8: unset
+ #else
+     if ((int)knob::moe_topk() != geom::TOPK) die("GR8_MOE_TOPK is a Flash-model option (this build is the GLM model)");
+ #endif
+diff --git a/engine/runtime/rank.cuh b/engine/runtime/rank.cuh
+index 6ed660b..d075971 100644
+--- a/engine/runtime/rank.cuh
++++ b/engine/runtime/rank.cuh
+@@ -20,6 +20,9 @@
+ // which reads context / page counts from a device cell that k_step_in writes; engine/attn/REPLAY.md).
+ // Call prepare(m, M, st) outside a capture before the first step with M rows.
+ #pragma once
++#if G6_MODEL_ML4
++#include "../kernels/ml4_glue.cuh"
++#endif
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdio>
+@@ -293,6 +296,9 @@ struct Layer
+     bool rp_on[NBK][MX + 1] = {};
+     const __nv_bfloat16 *attn_norm = nullptr, *mlp_norm = nullptr, *q_a_norm = nullptr;
+     const float* router_bias = nullptr;
++#if G6_MODEL_ML4
++    const float *ssmax = nullptr, *idx_qn = nullptr, *idx_ss = nullptr;   // Lnnn.ssmax [2][64], idx.q_norm [2][6144], idx.ssmax [2][32]
++#endif
+ };
+ 
+ #if defined(G6_CP) && G6_CP
+@@ -560,6 +566,9 @@ struct Model
+     const ds41::pack::Layout* ds41_pack = nullptr; // the eager ragged W pack only; null for every decode graph and single-session W chunk
+ #endif
+     __half *x = nullptr, *x2 = nullptr, *q_a = nullptr, *q_a_n = nullptr, *kv_a = nullptr, *q_b = nullptr;
++#if G6_MODEL_ML4
++    __half *q_raw = nullptr, *x_ln = nullptr, *attn_c = nullptr;   // ML4: wq out [MX][QBW/2], indexer LN [MX][HID], wo in [MX][QBW/2]
++#endif
+     __half *idx_q = nullptr, *idx_k = nullptr, *idx_w = nullptr;
+     float *logits = nullptr, *hlog = nullptr, *lp = nullptr, *lpt = nullptr;
+     glue::RoutePlan* plan = nullptr;
+@@ -814,6 +823,16 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
+     m.q_a_n = dmalloc<__half>((size_t)MX * QA);
+     m.kv_a = dmalloc<__half>((size_t)MX * KVA);
+     m.q_b = dmalloc<__half>((size_t)MX * g6nr::QBW);
++#if G6_MODEL_ML4
++    m.q_raw = dmalloc<__half>((size_t)MX * g6nr::QBW / 2);
++    m.x_ln = dmalloc<__half>((size_t)MX * HID);
++    m.attn_c = dmalloc<__half>((size_t)MX * g6nr::QBW / 2);
++    {   // LeRoPE x YaRN frequencies into the attention kernels' rope table (attn.cu cs)
++        const TensorRef f = find("G.rope_freq");
++        if (!f.p || f.nd != 1 || f.shape[0] != 32) die("ML4: G.rope_freq [32] f32 missing (tools/ml4_pack.py)");
++        G6RT_CK(g6a_ml4_rope((const float*)f.p, st));
++    }
++#endif
+     m.idx_q = dmalloc<__half>((size_t)MX * IDXQ);
+     m.idx_k = dmalloc<__half>((size_t)MX * IDXK);
+     m.idx_w = dmalloc<__half>((size_t)MX * IDXW);
+@@ -880,7 +899,12 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
+         if (const char* e = bind::check_shared_signs(y.T, st)) die("layer " + std::to_string(y.l) + ": " + e);
+ 
+         y.moe = y.T.t[bind::T_TR3_TAB].p != nullptr;
++#if G6_MODEL_ML4
++        y.indexer = y.T.t[bind::T_ML4_IDX_WQ_B].p != nullptr;
++        if (y.indexer != geom::full_index(y.l)) die("ML4 layer " + std::to_string(y.l) + ": indexer tensors disagree with geom::full_index");
++#else
+         y.indexer = y.T.t[bind::T_IDX_WQ_B].p != nullptr;
++#endif
+         if (y.indexer) last_index = i;
+         else if (last_index < 0) die("layer " + std::to_string(y.l) + " shares an index list but no full-index layer precedes it");
+         else y.index_src = last_index;
+@@ -922,8 +946,20 @@ inline void build(Model& m, int rank, const std::vector<int>& ids, const Find& f
+         check_headroom(rank, capacity, false);
+         y.attn_norm = (const __nv_bfloat16*)need(find, lname(y.l, "attn_norm"));
+         y.mlp_norm = (const __nv_bfloat16*)need(find, lname(y.l, "mlp_norm"));
++#if G6_MODEL_ML4
++        y.ssmax = (const float*)need(find, lname(y.l, "ssmax"));
++        if (y.indexer) { y.idx_qn = (const float*)need(find, lname(y.l, "idx.q_norm")); y.idx_ss = (const float*)need(find, lname(y.l, "idx.ssmax")); }
++        if (!geom::owns_kv(y.l))       // the source layer's MLA cache (it runs earlier in this model's layer list)
++        {
++            int src = -1;
++            for (int j = 0; j < i; ++j) if (m.layers[j].l == geom::kv_src(y.l)) src = j;
++            if (src < 0) die("ML4 layer " + std::to_string(y.l) + " reads layer " + std::to_string(geom::kv_src(y.l)) + "'s latent: run that layer before it");
++            G6RT_CK(g6a_ml4_bind_kv_alias(&y.ab, &m.layers[src].ab));
++        }
++#else
+         y.q_a_norm = (const __nv_bfloat16*)need(find, lname(y.l, "q_a_norm"));
+         if (y.moe) y.router_bias = (const float*)need(find, lname(y.l, "router.bias"));
++#endif
+     }
+     {
+         std::vector<int> sh(m.nl);
+@@ -1180,6 +1216,9 @@ inline const bind::Layer& G6RT_LAYER_BASE(Model& m, int i, int M)
+         io.attn_part = m.sc.part[0];
+         io.x2 = m.x2; io.logits = m.logits; io.plan = bind::plan_ptrs(m.plan);
+         io.mlp_part = m.sc.part[1];
++#if G6_MODEL_ML4
++        io.q_raw = m.q_raw; io.x_ln = m.x_ln; io.attn_c = m.attn_c;
++#endif
+         // GR8_FUSE=1 (default): fused K1 launch (bytes equal); 0: separate launches; 2: fused + KS1=2 WG=2 split at M=2,3 (different rounding, not bit-equal)
+         static const int fuse = (int)knob::fuse();
+         if (const char* e = bind::make_layer(y.T, M, m.sc, io, y.L[M], fuse))
+@@ -1624,8 +1663,68 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
+ 
+ // rows at positions m.pos[0..M-1] (device), context = last position + 1 (plain form; the graph form reads the cell)
+ // qph (QsPh): the gather phase the loopback driver wants (-1 = the whole block, as the real fabric runs it)
++#if G6_MODEL_ML4
++// Mistral Large 4 (the recipe's docs/PORT.md section 6): kv_a, the indexer's k and weights and wq on x; q in GLM's
++// layout (ml4::qprep: ssmax, sqrt(2), zero lanes); on indexer layers the LayerNorm query (ml4::ln, wq_b, ml4::ssmax); GLM's
++// attention core; its output compacted to 128 value dims for wo (dtr).
++inline void launch_attn_block_ml4(Model& m, int i, int M, int context, cudaStream_t st)
++{
++    Layer& y = m.layers[i];
++    const bind::Layer& b = layer_for(m, i, M);
++    if (m.qs.mode) die("ML4: GR8_QA_SPLIT is not supported");
++    dmark(DP_OTHER, st);
++#ifdef DEC_SLOT
++    if (i == 0) bind::launch(b.xf_x, st);      // later layers: the fragment tables come from launch_consume(2i-1)
++#else
++    bind::launch(b.xf_x, st);
++#endif
++    bind::launch(b.kv_a, st);                 // off on KV-sharing layers
++    bind::launch(b.idx_k, st);
++    bind::launch(b.idx_w, st);
++    dmark(DP_QA, st);
++    bind::launch_q_b(b, st);                  // wq -> m.q_raw
++    ml4::qprep(m.q_raw, m.pos, y.ssmax, y.ab.head_begin, b.heads, geom::rope(y.l) ? 1 : 0, m.q_b, M, st);
++    if (y.indexer && !posidx_step(m, i, M))
++    {
++        ml4::ln(m.x, HID, y.idx_qn, HID, m.x_ln, HID, M, st);
++        bind::launch(b.xf_qa, st);            // fragments of x_ln
++        bind::launch(b.idx_q, st);
++        ml4::ssmax(m.idx_q, m.pos, y.idx_ss, geom::IDX_HEADS, geom::IDX_DIM, M, st);
++    }
++    dmark(DP_QB, st);
++#ifdef DEC_S2
++    if (m.s2on) s2_attention(m, i, M, st);
++    else
++#endif
++    if (m.graph)
++    {
++        if (!y.rp_on[m.cur][M]) die("prepare(m, M) was not called before a graph step");
++        G6RT_CK(g6_attn_replay_run(&y.rp[m.cur][M], st));
++    }
++    else
++    {
++        const G6AttnStep s = attn_step(m, i, M, context);
++        G6RT_CK(g6_attn_bind_run(&y.ab, &s, st));
++    }
++    dmark(DP_ATTN, st);
++    ml4::compact((const __half*)y.ab.args.output, b.heads, m.attn_c, M, st);
++    bind::launch_o_proj(b, st);
++#ifdef DEC_SLOT
++    slot_publish(m, 2 * i, st);
++#else
++    put_publish(m, m.sc.part[0], 2 * i, M, st);
++#endif
++    dmark(DP_OPROJ, st);
++}
++#endif
++
+ inline void launch_attn_block(Model& m, int i, int M, int context, cudaStream_t st, int qph = -1)
+ {
++#if G6_MODEL_ML4
++    (void)qph;
++    launch_attn_block_ml4(m, i, M, context, st);
++    return;
++#endif
+ #if G6_MODEL_FLASH
+     if(m.resid4 || m.flash_draft) { if(m.layers[i].kda) launch_kda_block(m,i,M,st); else launch_dsa_block(m,i,M,context,st); return; }
+ #endif
+@@ -1780,7 +1879,12 @@ inline void launch_mlp_block(Model& m, int i, int M, cudaStream_t st)
+ #endif
+             keep = 1u << (M - 1);
+         }
++#if G6_MODEL_ML4
++        (void)keep; (void)keep_dev;
++        glue::k_router_plan_ml4<<<1, glue::ML4_RT, 0, st>>>(m.logits, M, m.plan);
++#else
+         glue::k_router_plan<<<1, glue::NEXP, 0, st>>>(m.logits, y.router_bias, M, m.plan, keep, keep_dev);
++#endif
+         if (m.rlog) G6RT_CK(cudaMemcpyAsync(m.rlog + (size_t)i * RLOG, m.plan, RLOG * sizeof(int), cudaMemcpyDeviceToHost, st));
+     }
+     dmark(DP_ROUTER, st);
+@@ -2174,6 +2278,9 @@ inline void launch_head_local(Model& m, int M, cudaStream_t st)
+ #endif
+     bind::launch(H.xf_h, st);
+     bind::launch(H.lm_head, st);
++#if G6_MODEL_ML4
++    ml4::softcap(static_cast<float*>(H.lm_head.y), H.lm_head.ld, H.vn, M, st);   // 30 tanh(x / 30) before argmax / LSE / sampling
++#endif
+     if (m.pen_rows)
+     {
+         k_penalty<<<M, 256, 0, st>>>(m.hlog, m.vn, m.vlo, m.vn, m.tok, m.pen_rows, m.pen_sess, m.pen_counts);
+-- 
+2.43.0
+

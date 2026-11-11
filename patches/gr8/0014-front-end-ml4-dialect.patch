@@ -1,0 +1,710 @@
+From 905007b1b1a0e6d45cf2360ade5b3986e0372ca2 Mon Sep 17 00:00:00 2001
+From: gr8-ml4 <benjamin.j.millar@gmail.com>
+Date: Mon, 9 Nov 2026 22:06:23 +0000
+Subject: [PATCH] front end: ml4 dialect (Mistral Large 4): [THINK] reasoning
+ and [TOOL_CALLS] parser, bos_token in the template, forced tool_choice,
+ vllm:kv_cache_usage_perc
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ frontend/g6front-rs/src/api.rs         |   6 +-
+ frontend/g6front-rs/src/dialect.rs     |  35 ++-
+ frontend/g6front-rs/src/main.rs        |  19 +-
+ frontend/g6front-rs/src/metrics.rs     |   6 +
+ frontend/g6front-rs/src/ml4parser.rs   | 393 +++++++++++++++++++++++++
+ frontend/g6front-rs/src/template.rs    |   5 +
+ frontend/g6front-rs/src/tok.rs         |   3 +
+ frontend/g6front-rs/src/tool_choice.rs |  10 +
+ 8 files changed, 468 insertions(+), 9 deletions(-)
+ create mode 100644 frontend/g6front-rs/src/ml4parser.rs
+
+diff --git a/frontend/g6front-rs/src/api.rs b/frontend/g6front-rs/src/api.rs
+index e5fe78d..8ec8e8f 100644
+--- a/frontend/g6front-rs/src/api.rs
++++ b/frontend/g6front-rs/src/api.rs
+@@ -568,7 +568,11 @@ async fn chat_prepare(st: &'static State, body: &Map<String, Value>, raw: &[u8])
+         (Some(s), Some(e)) if think_open(&prompt, s, e) => st.tok.think_close.as_slice(),
+         _ => &[],
+     };
+-    let force = if ds { choice.forced_ids_ds(&st.tok, close)? } else { choice.forced_ids(&st.tok, close)? };
++    let force = match st.dialect {
++        Dialect::Ds41 => choice.forced_ids_ds(&st.tok, close)?,
++        Dialect::Ml4 => choice.forced_ids_ml4(&st.tok)?,
++        Dialect::Glm => choice.forced_ids(&st.tok, close)?,
++    };
+     params.gen.system_tokens = system;
+     // a JSON mode with no tools: the engine masks the reply to the grammar (after the think close while the prompt leaves
+     // the think block open); the extraction after generation still runs. With tools the grammar would forbid a call
+diff --git a/frontend/g6front-rs/src/dialect.rs b/frontend/g6front-rs/src/dialect.rs
+index 54681dc..c87691c 100644
+--- a/frontend/g6front-rs/src/dialect.rs
++++ b/frontend/g6front-rs/src/dialect.rs
+@@ -12,6 +12,7 @@ use serde_json::{Map, Value};
+ 
+ use crate::api::ApiError;
+ use crate::dsparser::DsParser;
++use crate::ml4parser::Ml4Parser;
+ use crate::parser::{Delta, FullParse, GlmParser};
+ use crate::pyjson;
+ use crate::thinking::{self, Thinking};
+@@ -20,6 +21,9 @@ use crate::thinking::{self, Thinking};
+ pub enum Dialect {
+     Glm,
+     Ds41,
++    /// Mistral Large 4: the pack's jinja chat template (as GLM), `[THINK]` reasoning and `[TOOL_CALLS]` calls
++    /// (`ml4parser.rs`); thinking cannot be turned off; `reasoning_effort` low / medium / high
++    Ml4,
+ }
+ 
+ impl Dialect {
+@@ -27,6 +31,7 @@ impl Dialect {
+         match self {
+             Dialect::Glm => "glm",
+             Dialect::Ds41 => "ds41",
++            Dialect::Ml4 => "ml4",
+         }
+     }
+ 
+@@ -35,14 +40,19 @@ impl Dialect {
+         match s {
+             "glm" => Ok(Some(Dialect::Glm)),
+             "ds41" => Ok(Some(Dialect::Ds41)),
++            "ml4" => Ok(Some(Dialect::Ml4)),
+             "auto" => Ok(None),
+-            other => Err(format!("--dialect {other}: want glm, ds41 or auto")),
++            other => Err(format!("--dialect {other}: want glm, ds41, ml4 or auto")),
+         }
+     }
+ 
+     /// A model directory whose `config.json` names a DeepseekV4 architecture, or whose tokenizer has the `｜DSML｜` token
+     /// (the 1017 release's `config.json` is the inference layout and names no architecture), is DeepSeek; any other is GLM.
+-    pub fn detect(dir: &Path, tokenizer_has_dsml: bool) -> Dialect {
++    /// A tokenizer with Mistral's `[TOOL_CALLS]` token is Mistral Large 4.
++    pub fn detect(dir: &Path, tokenizer_has_dsml: bool, tokenizer_has_tool_calls: bool) -> Dialect {
++        if tokenizer_has_tool_calls {
++            return Dialect::Ml4;
++        }
+         let arch_is_ds = std::fs::read(dir.join("config.json"))
+             .ok()
+             .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+@@ -61,6 +71,7 @@ impl Dialect {
+ pub enum AnyParser {
+     Glm(GlmParser),
+     Ds(DsParser),
++    Ml4(Ml4Parser),
+ }
+ 
+ impl AnyParser {
+@@ -68,6 +79,7 @@ impl AnyParser {
+         match d {
+             Dialect::Glm => AnyParser::Glm(GlmParser::new(tools, tool_choice, include_reasoning)),
+             Dialect::Ds41 => AnyParser::Ds(DsParser::new(tools, tool_choice, include_reasoning)),
++            Dialect::Ml4 => AnyParser::Ml4(Ml4Parser::new(tools, tool_choice, include_reasoning)),
+         }
+     }
+ 
+@@ -85,6 +97,7 @@ impl AnyParser {
+         match self {
+             AnyParser::Glm(p) => AnyParser::Glm(p.content_first()),
+             AnyParser::Ds(p) => AnyParser::Ds(p.content_first()),
++            AnyParser::Ml4(p) => AnyParser::Ml4(p.content_first()),
+         }
+     }
+ 
+@@ -92,6 +105,7 @@ impl AnyParser {
+         match self {
+             AnyParser::Glm(p) => p.delta(text, finished),
+             AnyParser::Ds(p) => p.delta(text, finished),
++            AnyParser::Ml4(p) => p.delta(text, finished),
+         }
+     }
+ 
+@@ -107,7 +121,7 @@ impl AnyParser {
+     pub fn glm_mut(&mut self) -> Option<&mut GlmParser> {
+         match self {
+             AnyParser::Glm(p) => Some(p),
+-            AnyParser::Ds(_) => None,
++            AnyParser::Ds(_) | AnyParser::Ml4(_) => None,
+         }
+     }
+ 
+@@ -115,6 +129,7 @@ impl AnyParser {
+         match self {
+             AnyParser::Glm(p) => p.parse_full(text),
+             AnyParser::Ds(p) => p.parse_full(text),
++            AnyParser::Ml4(p) => p.parse_full(text),
+         }
+     }
+ 
+@@ -122,6 +137,7 @@ impl AnyParser {
+         match self {
+             AnyParser::Glm(p) => p.include_reasoning,
+             AnyParser::Ds(p) => p.include_reasoning,
++            AnyParser::Ml4(p) => p.include_reasoning,
+         }
+     }
+ 
+@@ -129,7 +145,7 @@ impl AnyParser {
+     /// closer to stop on; the model sometimes goes on writing after it (the 10,559-line `</function>` runaway).
+     pub fn call_closed(&self) -> bool {
+         match self {
+-            AnyParser::Glm(_) => false,
++            AnyParser::Glm(_) | AnyParser::Ml4(_) => false,
+             AnyParser::Ds(p) => p.call_closed(),
+         }
+     }
+@@ -310,6 +326,16 @@ pub fn ds_system_text(messages: Option<&Value>, tools: Option<&Value>, thinking:
+ 
+ // ---- forced tool_choice ----------------------------------------------------------------------------------------------
+ 
++/// Mistral Large 4's forced reply: a call opener as the template writes one, `[TOOL_CALLS]name[ARGS]` for a named
++/// function, `[TOOL_CALLS]` for `required` (the model writes the name; the parser checks it against the offered tools).
++pub fn ml4_forced_text(name: Option<&str>) -> String {
++    use crate::ml4parser::{ARGS, CALLS};
++    match name {
++        Some(n) => format!("{CALLS}{n}{ARGS}"),
++        None => CALLS.to_string(),
++    }
++}
++
+ /// What a forced `tool_choice` puts in the reply: the start of a DSML call block, as the encoder writes one after an
+ /// empty answer. A named function carries its name and the start of its parameters; `required` stops after `invoke`, so
+ /// the model writes ` name="..."` itself and the parser checks the name against the offered tools.
+@@ -494,6 +520,7 @@ mod tests {
+     fn the_flag_parses() {
+         assert_eq!(Dialect::parse_flag("ds41"), Ok(Some(Dialect::Ds41)));
+         assert_eq!(Dialect::parse_flag("glm"), Ok(Some(Dialect::Glm)));
++        assert_eq!(Dialect::parse_flag("ml4"), Ok(Some(Dialect::Ml4)));
+         assert_eq!(Dialect::parse_flag("auto"), Ok(None));
+         assert!(Dialect::parse_flag("qwen").is_err());
+     }
+diff --git a/frontend/g6front-rs/src/main.rs b/frontend/g6front-rs/src/main.rs
+index 0e87a7f..e440960 100644
+--- a/frontend/g6front-rs/src/main.rs
++++ b/frontend/g6front-rs/src/main.rs
+@@ -5,6 +5,7 @@
+ 
+ mod api;
+ mod dialect;
++mod ml4parser;
+ mod dschat;
+ mod dsparser;
+ mod engine;
+@@ -324,19 +325,28 @@ async fn serve(args: Args) -> Result<(), String> {
+     .await
+     .map_err(|e| e.to_string())??;
+     let dialect = args.dialect.unwrap_or_else(|| {
+-        dialect::Dialect::detect(&PathBuf::from(&args.model_dir), tok.tk.token_to_id("｜DSML｜").is_some())
++        dialect::Dialect::detect(
++            &PathBuf::from(&args.model_dir),
++            tok.tk.token_to_id("｜DSML｜").is_some(),
++            tok.tk.token_to_id("[TOOL_CALLS]").is_some(),
++        )
+     });
+     let (template, thinking_defaults, ds_effort) = match dialect {
+-        dialect::Dialect::Glm => {
+-            let template = template::ChatTemplate::load(
++        dialect::Dialect::Glm | dialect::Dialect::Ml4 => {
++            let mut template = template::ChatTemplate::load(
+                 &PathBuf::from(&args.model_dir),
+                 tok.eos_token.clone(),
+                 tok.pad_token.clone(),
+             )?;
++            if dialect == dialect::Dialect::Ml4 {
++                // the template opens with {{ bos_token }}: the prompt is encoded without special tokens added
++                template.add_special("bos_token", tok.bos_token.clone());
++            }
+             let effort = args.default_effort.as_deref().map(thinking::parse_default_effort).transpose()?;
+             log::info!(
+-                "dialect glm: tokenizer + template loaded in {:.0} ms (vocab {}); reasoning efforts the template names: \
++                "dialect {}: tokenizer + template loaded in {:.0} ms (vocab {}); reasoning efforts the template names: \
+                  {:?}; default effort {:?}, default thinking budget {}, thinking off {}",
++                dialect.name(),
+                 t0.elapsed().as_secs_f64() * 1e3,
+                 tok.vocab_size,
+                 template.levels,
+@@ -379,6 +389,7 @@ async fn serve(args: Args) -> Result<(), String> {
+     let served = args.served.unwrap_or_else(|| match dialect {
+         dialect::Dialect::Glm => vec!["glm-5.3".into(), "glm53".into()],
+         dialect::Dialect::Ds41 => vec!["deepseek-v4.1-flash".into()],
++        dialect::Dialect::Ml4 => vec!["mistral-large-4".into()],
+     });
+     if args.emit_undeclared {
+         log::info!("calls to tools a request did not declare come back as tool calls (--undeclared-tool-calls emit)");
+diff --git a/frontend/g6front-rs/src/metrics.rs b/frontend/g6front-rs/src/metrics.rs
+index ef1cb56..52a2c3e 100644
+--- a/frontend/g6front-rs/src/metrics.rs
++++ b/frontend/g6front-rs/src/metrics.rs
+@@ -116,6 +116,12 @@ pub fn render(m: &Value, model_name: &str, front: Front) -> String {
+                 metric(name, "gauge", help, &[(String::new(), value)]);
+             }
+         }
++        // vLLM's usage gauge (a fraction, 1 = full), which dashboards such as sparkDash read
++        if let (Some(a), Some(z)) = (kv.get("active_tokens").and_then(Value::as_f64), kv.get("size_tokens").and_then(Value::as_f64)) {
++            if z > 0.0 {
++                metric("vllm:kv_cache_usage_perc", "gauge", "KV-cache usage. 1 means 100 percent usage.", &[(String::new(), (a / z).min(1.0))]);
++            }
++        }
+     }
+     if let Some(cached) = tk.get("cached").and_then(Value::as_f64) {
+         metric(
+diff --git a/frontend/g6front-rs/src/ml4parser.rs b/frontend/g6front-rs/src/ml4parser.rs
+new file mode 100644
+index 0000000..bb19e7a
+--- /dev/null
++++ b/frontend/g6front-rs/src/ml4parser.rs
+@@ -0,0 +1,393 @@
++//! Mistral Large 4 reply parser: reasoning split + `[TOOL_CALLS]` calls (the inverse of the pack's chat_template.jinja).
++//!
++//! The reply, as the template writes an assistant turn back:
++//! - an optional think block, `[THINK]` reasoning `[/THINK]` (two special tokens), at the start of the reply; the prompt
++//!   never opens one, so the reply starts as the answer and the block opens in it;
++//! - the answer text;
++//! - zero or more calls, each `[TOOL_CALLS]name[ARGS]{json arguments}` (`[TOOL_CALLS]` and `[ARGS]` are special tokens);
++//! - the end of sequence (the engine stops on it; it is not text here).
++//!
++//! A call is taken only if tools were offered and `tool_choice` is not none, its name is an offered tool and its
++//! arguments are one well-formed JSON object. Anything else stays answer text, byte for byte. A `[THINK]` after the
++//! answer has started, or a second one, is text too.
++//!
++//! Streaming: partial tags are held back, and a call is emitted whole (id, name, arguments) once its JSON object closes.
++
++use std::collections::HashSet;
++
++use serde_json::Value;
++
++use crate::parser::{tool_call_id, Delta, FullParse, ToolDelta};
++use crate::pyjson::is_py_space;
++
++pub const THINK_OPEN: &str = "[THINK]";
++pub const THINK_CLOSE: &str = "[/THINK]";
++pub const CALLS: &str = "[TOOL_CALLS]";
++pub const ARGS: &str = "[ARGS]";
++
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++enum Mode {
++    /// Before any answer text: a think block may open here.
++    Start,
++    Reasoning,
++    Content,
++    /// After `[TOOL_CALLS]`, undecided: `buf` holds the name, `[ARGS]` and the arguments so far.
++    Call,
++}
++
++#[derive(Default)]
++struct Out {
++    reasoning: String,
++    content: String,
++    calls: Vec<ToolDelta>,
++}
++
++enum Parsed {
++    Need,
++    Bad,
++    /// (bytes used, name, arguments)
++    Ok(usize, String, String),
++}
++
++pub struct Ml4Parser {
++    tools: HashSet<String>,
++    parse_tools: bool,
++    pub include_reasoning: bool,
++    mode: Mode,
++    buf: String,
++    thought: bool,
++    n_calls: usize,
++}
++
++impl Ml4Parser {
++    /// `tools` is the request's tool list (OpenAI format).
++    pub fn new(tools: Option<&Value>, tool_choice: &Value, include_reasoning: bool) -> Ml4Parser {
++        let mut names = HashSet::new();
++        let mut any = false;
++        if let Some(Value::Array(ts)) = tools {
++            any = !ts.is_empty();
++            for t in ts {
++                if let Some(n) = crate::dschat::tool_name(t) {
++                    names.insert(n);
++                }
++            }
++        }
++        Ml4Parser {
++            tools: names,
++            parse_tools: any && tool_choice.as_str() != Some("none"),
++            include_reasoning,
++            mode: Mode::Start,
++            buf: String::new(),
++            thought: false,
++            n_calls: 0,
++        }
++    }
++
++    /// The reply starts as the answer, with no think block (a forced call: the insert rule wrote `[TOOL_CALLS]`).
++    pub fn content_first(mut self) -> Ml4Parser {
++        self.mode = Mode::Content;
++        self
++    }
++
++    fn content(&mut self, t: &str, out: &mut Out) {
++        if !t.is_empty() {
++            if self.mode == Mode::Start && !t.chars().all(is_py_space) {
++                self.mode = Mode::Content;
++            }
++            out.content.push_str(t);
++        }
++    }
++
++    fn feed(&mut self, text: &str, finished: bool) -> Out {
++        let mut out = Out::default();
++        self.buf.push_str(text);
++        loop {
++            match self.mode {
++                Mode::Start | Mode::Content => {
++                    let think = (self.mode == Mode::Start && !self.thought).then(|| self.buf.find(THINK_OPEN)).flatten();
++                    let call = self.parse_tools.then(|| self.buf.find(CALLS)).flatten();
++                    let next = match (think, call) {
++                        (Some(a), Some(b)) => Some(a.min(b)),
++                        (a, b) => a.or(b),
++                    };
++                    if let Some(p) = next {
++                        let head = self.buf[..p].to_string();
++                        if Some(p) == think {
++                            // only whitespace may come before the block (the template writes none)
++                            if head.chars().all(is_py_space) {
++                                self.buf.drain(..p + THINK_OPEN.len());
++                                self.mode = Mode::Reasoning;
++                                self.thought = true;
++                            } else {
++                                self.content(&head, &mut out);
++                                self.mode = Mode::Content;
++                                self.buf.drain(..p);
++                                let t = THINK_OPEN.to_string();
++                                self.content(&t, &mut out);
++                                self.buf.drain(..THINK_OPEN.len());
++                            }
++                        } else {
++                            self.content(&head, &mut out);
++                            self.buf.drain(..p + CALLS.len());
++                            self.mode = Mode::Call;
++                        }
++                        continue;
++                    }
++                    let keep = if finished {
++                        0
++                    } else {
++                        let mut k = 0;
++                        if self.mode == Mode::Start && !self.thought {
++                            k = k.max(partial_tag(&self.buf, THINK_OPEN));
++                        }
++                        if self.parse_tools {
++                            k = k.max(partial_tag(&self.buf, CALLS));
++                        }
++                        k
++                    };
++                    let n = self.buf.len() - keep;
++                    let t: String = self.buf.drain(..n).collect();
++                    self.content(&t, &mut out);
++                    break;
++                }
++                Mode::Reasoning => {
++                    if let Some(p) = self.buf.find(THINK_CLOSE) {
++                        out.reasoning.push_str(&self.buf[..p]);
++                        self.buf.drain(..p + THINK_CLOSE.len());
++                        self.mode = Mode::Start;   // the answer, or a call, follows; no second block
++                        continue;
++                    }
++                    let keep = if finished { 0 } else { partial_tag(&self.buf, THINK_CLOSE) };
++                    let n = self.buf.len() - keep;
++                    out.reasoning.push_str(&self.buf[..n]);
++                    self.buf.drain(..n);
++                    break;
++                }
++                Mode::Call => match parse_call(&self.buf, &self.tools) {
++                    Parsed::Need if !finished => break,
++                    Parsed::Ok(used, name, args) => {
++                        out.calls.push(ToolDelta {
++                            index: self.n_calls,
++                            id: Some(tool_call_id()),
++                            name: Some(name),
++                            arguments: Some(args),
++                        });
++                        self.n_calls += 1;
++                        self.buf.drain(..used);
++                        // whitespace between calls is not answer text
++                        let ws = self.buf.len() - self.buf.trim_start_matches(is_py_space).len();
++                        if ws < self.buf.len() || finished {
++                            self.buf.drain(..ws);
++                        }
++                        self.mode = Mode::Content;
++                        continue;
++                    }
++                    Parsed::Need | Parsed::Bad => {
++                        // not a call: the opener and what followed are answer text
++                        let rest = std::mem::take(&mut self.buf);
++                        self.mode = Mode::Content;
++                        let t = CALLS.to_string();
++                        self.content(&t, &mut out);
++                        // scanning resumes after the opener (a later [TOOL_CALLS] may still be a call)
++                        self.buf = rest;
++                        continue;
++                    }
++                },
++            }
++        }
++        out
++    }
++
++    // ---- streaming API ------------------------------------------------------------------------------------------
++
++    /// Feed newly decoded text; the delta's fields, or None if there is nothing to send yet.
++    pub fn delta(&mut self, text: &str, finished: bool) -> Option<Delta> {
++        let o = self.feed(text, finished);
++        let d = Delta {
++            content: (!o.content.is_empty()).then_some(o.content),
++            reasoning: (!o.reasoning.is_empty() && self.include_reasoning).then_some(o.reasoning),
++            tool_calls: o.calls,
++        };
++        (d.content.is_some() || d.reasoning.is_some() || !d.tool_calls.is_empty()).then_some(d)
++    }
++
++    // ---- non-streaming API --------------------------------------------------------------------------------------
++
++    /// On a fresh parser: the whole output at once.
++    pub fn parse_full(&mut self, text: &str) -> FullParse {
++        let o = self.feed(text, true);
++        let calls: Vec<(String, String, String)> = o
++            .calls
++            .into_iter()
++            .map(|c| (c.id.unwrap_or_else(tool_call_id), c.name.unwrap_or_default(), c.arguments.unwrap_or_default()))
++            .collect();
++        let content = if calls.is_empty() {
++            o.content.trim_start_matches(is_py_space).to_string()
++        } else {
++            o.content.trim_matches(is_py_space).to_string()
++        };
++        FullParse {
++            reasoning: (!o.reasoning.is_empty()).then_some(o.reasoning),
++            content: (!content.is_empty()).then_some(content),
++            calls,
++        }
++    }
++}
++
++/// The length of the longest proper prefix of `tag` that `text` ends with: bytes that may be the start of the tag.
++fn partial_tag(text: &str, tag: &str) -> usize {
++    let (t, g) = (text.as_bytes(), tag.as_bytes());
++    (1..g.len().min(t.len() + 1)).rev().find(|&n| t.ends_with(&g[..n])).unwrap_or(0)
++}
++
++/// `name[ARGS]{...}` at the start of `s` (after `[TOOL_CALLS]`): the arguments are one JSON object, read up to its
++/// closing brace (strings and escapes respected), then checked with serde_json.
++fn parse_call(s: &str, known: &HashSet<String>) -> Parsed {
++    let Some(a) = s.find(ARGS) else {
++        // a name is short and has no special token or newline in it (a partial [ARGS] at the end may still arrive)
++        let head = &s[..s.len() - partial_tag(s, ARGS)];
++        return if head.contains(['\n', '[']) || s.len() > 256 { Parsed::Bad } else { Parsed::Need };
++    };
++    let name = s[..a].trim();
++    if name.is_empty() || name.contains(['\n', '[']) || !known.contains(name) {
++        return Parsed::Bad;
++    }
++    let body = &s[a + ARGS.len()..];
++    let lead = body.len() - body.trim_start_matches(is_py_space).len();
++    let b = &body[lead..];
++    if b.is_empty() {
++        return Parsed::Need;
++    }
++    if !b.starts_with('{') {
++        return Parsed::Bad;
++    }
++    let (mut depth, mut in_str, mut esc) = (0i64, false, false);
++    for (i, c) in b.char_indices() {
++        if in_str {
++            if esc {
++                esc = false;
++            } else if c == '\\' {
++                esc = true;
++            } else if c == '"' {
++                in_str = false;
++            }
++            continue;
++        }
++        match c {
++            '"' => in_str = true,
++            '{' | '[' => depth += 1,
++            '}' | ']' => {
++                depth -= 1;
++                if depth == 0 {
++                    let json = &b[..=i];
++                    return match serde_json::from_str::<Value>(json) {
++                        Ok(Value::Object(_)) => Parsed::Ok(a + ARGS.len() + lead + i + 1, name.to_string(), json.to_string()),
++                        _ => Parsed::Bad,
++                    };
++                }
++            }
++            _ => {}
++        }
++    }
++    Parsed::Need
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use serde_json::json;
++
++    fn tools() -> Value {
++        json!([
++            {"type": "function", "function": {"name": "count_words", "parameters": {"type": "object"}}},
++            {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}}
++        ])
++    }
++
++    type Got = (String, String, Vec<(String, String)>);
++
++    fn whole(p: &mut Ml4Parser, text: &str) -> Got {
++        let o = p.feed(text, true);
++        (o.reasoning, o.content, o.calls.into_iter().map(|c| (c.name.unwrap(), c.arguments.unwrap())).collect())
++    }
++
++    /// The same reply fed one character at a time.
++    fn by_char(mut p: Ml4Parser, text: &str) -> Got {
++        let (mut r, mut c, mut calls) = (String::new(), String::new(), Vec::new());
++        let cs: Vec<char> = text.chars().collect();
++        for (i, ch) in cs.iter().enumerate() {
++            let o = p.feed(&ch.to_string(), i + 1 == cs.len());
++            r.push_str(&o.reasoning);
++            c.push_str(&o.content);
++            calls.extend(o.calls.into_iter().map(|c| (c.name.unwrap(), c.arguments.unwrap())));
++        }
++        (r, c, calls)
++    }
++
++    fn p(t: Option<&Value>) -> Ml4Parser {
++        Ml4Parser::new(t, &json!("auto"), true)
++    }
++
++    #[test]
++    fn reasoning_then_answer() {
++        let text = "[THINK]step one[/THINK]The answer is 42.";
++        let want = ("step one".to_string(), "The answer is 42.".to_string(), vec![]);
++        assert_eq!(whole(&mut p(None), text), want);
++        assert_eq!(by_char(p(None), text), want);
++    }
++
++    #[test]
++    fn answer_without_a_think_block() {
++        assert_eq!(whole(&mut p(None), "Hello there.").1, "Hello there.");
++        // a [THINK] after the answer started is text
++        let (r, c, _) = whole(&mut p(None), "Hi [THINK]x[/THINK]");
++        assert_eq!((r.as_str(), c.as_str()), ("", "Hi [THINK]x[/THINK]"));
++    }
++
++    #[test]
++    fn a_call_after_thinking() {
++        let t = tools();
++        let text = "[THINK]need a tool[/THINK][TOOL_CALLS]count_words[ARGS]{\"phrase\": \"a b {c}\"}";
++        let want = ("need a tool".to_string(), String::new(), vec![("count_words".to_string(), "{\"phrase\": \"a b {c}\"}".to_string())]);
++        assert_eq!(whole(&mut p(Some(&t)), text), want);
++        assert_eq!(by_char(p(Some(&t)), text), want);
++    }
++
++    #[test]
++    fn two_calls_and_text_before() {
++        let t = tools();
++        let text = "Let me check.[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Paris\"}[TOOL_CALLS]count_words[ARGS]{\"phrase\": \"x\"}";
++        let (_, c, calls) = by_char(p(Some(&t)), text);
++        assert_eq!(c, "Let me check.");
++        assert_eq!(calls.len(), 2);
++        assert_eq!(calls[1], ("count_words".to_string(), "{\"phrase\": \"x\"}".to_string()));
++        let f = p(Some(&t)).parse_full(text);
++        assert_eq!((f.content.as_deref(), f.calls.len()), (Some("Let me check."), 2));
++    }
++
++    #[test]
++    fn unknown_tool_or_bad_json_stays_text() {
++        let t = tools();
++        for text in ["[TOOL_CALLS]delete_all[ARGS]{}", "[TOOL_CALLS]count_words[ARGS]{\"phrase\": }", "[TOOL_CALLS]count_words[ARGS]{\"phrase\""] {
++            let (_, c, calls) = whole(&mut p(Some(&t)), text);
++            assert_eq!((c.as_str(), calls.len()), (text, 0), "{text}");
++            let (_, c, calls) = by_char(p(Some(&t)), text);
++            assert_eq!((c.as_str(), calls.len()), (text, 0), "{text} by char");
++        }
++    }
++
++    #[test]
++    fn no_tools_or_tool_choice_none_is_all_text() {
++        let text = "[TOOL_CALLS]count_words[ARGS]{}";
++        assert_eq!(whole(&mut p(None), text).1, text);
++        let t = tools();
++        assert_eq!(whole(&mut Ml4Parser::new(Some(&t), &json!("none"), true), text).1, text);
++    }
++
++    #[test]
++    fn reasoning_is_dropped_from_deltas_when_not_wanted() {
++        let mut q = Ml4Parser::new(None, &json!("auto"), false);
++        let d = q.delta("[THINK]hidden[/THINK]shown", true).unwrap();
++        assert_eq!((d.reasoning, d.content.as_deref()), (None, Some("shown")));
++    }
++}
+diff --git a/frontend/g6front-rs/src/template.rs b/frontend/g6front-rs/src/template.rs
+index 5480b68..ec265cd 100644
+--- a/frontend/g6front-rs/src/template.rs
++++ b/frontend/g6front-rs/src/template.rs
+@@ -81,6 +81,11 @@ impl ChatTemplate {
+         })
+     }
+ 
++    /// One more special the template reads (Mistral Large 4: `bos_token`).
++    pub fn add_special(&mut self, name: &'static str, value: Value) {
++        self.special.push((name, value));
++    }
++
+     pub fn resolve_thinking(
+         &self,
+         body: &Map<String, Value>,
+diff --git a/frontend/g6front-rs/src/tok.rs b/frontend/g6front-rs/src/tok.rs
+index 9fda900..e037ee4 100644
+--- a/frontend/g6front-rs/src/tok.rs
++++ b/frontend/g6front-rs/src/tok.rs
+@@ -29,6 +29,8 @@ const PAR_PIECE_BYTES: usize = 16 << 10;
+ pub struct Tok {
+     pub tk: &'static Tokenizer,
+     pub eos_token: Value,
++    /// tokenizer_config.json bos_token (a template may write it: Mistral Large 4)
++    pub bos_token: Value,
+     pub eos_token_id: Option<u32>,
+     pub eos_ids: Vec<i64>,
+     pub pad_token: Value,
+@@ -93,6 +95,7 @@ impl Tok {
+         let mut t = Tok {
+             tk,
+             eos_token,
++            bos_token: cfg.get("bos_token").cloned().unwrap_or(Value::Null),
+             eos_token_id,
+             eos_ids,
+             pad_token: cfg.get("pad_token").cloned().unwrap_or(Value::Null),
+diff --git a/frontend/g6front-rs/src/tool_choice.rs b/frontend/g6front-rs/src/tool_choice.rs
+index c8abf37..fa23360 100644
+--- a/frontend/g6front-rs/src/tool_choice.rs
++++ b/frontend/g6front-rs/src/tool_choice.rs
+@@ -130,6 +130,16 @@ impl ToolChoice {
+         self.forced_ids_for(text, tok, think_close)
+     }
+ 
++    /// Mistral Large 4's forced reply (`dialect::ml4_forced_text`): the reply starts with the call, no think block.
++    pub fn forced_ids_ml4(&self, tok: &Tok) -> Result<Vec<u32>, ApiError> {
++        let text = match self {
++            ToolChoice::Required => Some(crate::dialect::ml4_forced_text(None)),
++            ToolChoice::Named(name) => Some(crate::dialect::ml4_forced_text(Some(name))),
++            ToolChoice::None | ToolChoice::Auto => None,
++        };
++        self.forced_ids_for(text, tok, &[])
++    }
++
+     fn forced_ids_for(&self, text: Option<String>, tok: &Tok, think_close: &[u32]) -> Result<Vec<u32>, ApiError> {
+         let Some(text) = text else { return Ok(Vec::new()) };
+         let opener = tok.encode(&text, false).map_err(|e| ApiError::new(500, &e, None))?;
+-- 
+2.43.0
+

@@ -1,0 +1,147 @@
+From 8ae5802e4cfc77f5f59641c2daef77800c9503ca Mon Sep 17 00:00:00 2001
+From: gr8-ml4 <benjamin.j.millar@gmail.com>
+Date: Mon, 9 Nov 2026 20:38:51 +0000
+Subject: [PATCH] ML4 prefill: unpack the F16W matrices a layer at a time into
+ a lane buffer (61 MB) instead of 2.86 GB resident copies; same bytes
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ engine/kernels/bind_prefill.cuh | 54 +++++++++++++++++++--------------
+ engine/runtime/prefill.cuh      | 19 +++++++-----
+ 2 files changed, 43 insertions(+), 30 deletions(-)
+
+diff --git a/engine/kernels/bind_prefill.cuh b/engine/kernels/bind_prefill.cuh
+index a36c72a..da6a762 100644
+--- a/engine/kernels/bind_prefill.cuh
++++ b/engine/kernels/bind_prefill.cuh
+@@ -6289,7 +6289,7 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const
+ // ------------------------------------------------------------------------------------------ Mistral Large 4 prefill
+ // One ML4 layer of one rank over an M-row sub-batch (the recipe's docs/PORT.md section 8, X6), with the decode tensors
+ // (bind::LayerTensors): wq / wo / layer 0's dense MLP as the fp16 trellis GEMM (k_gemm_tr_h16 format 1, K3 mul1), the
+-// F16W matrices (kv_a, the indexer's wq_b / wk / weights_proj, the router) as fp16 cuBLAS GEMMs on plain fp16 copies,
++// F16W matrices (kv_a, the indexer's wq_b / wk / weights_proj, the router) as fp16 cuBLAS GEMMs on plain fp16 (ml4_unpack),
+ // the routed experts as the fp16 passes (Expert::h16, mul1) with the shared expert as Expert::shr's expert NEXP (row 128).
+ 
+ // y [M][O] = x [M][ldx] @ w [O][K]^T, fp16 in, fp32 accumulate, fp16 out (f32: fp32 out) - the decode F16W GEMV's math
+@@ -6327,35 +6327,45 @@ __global__ void __launch_bounds__(256) k_f16w_plain(const __half* rec, int O, in
+     const int r = (l >> 2) + ((q & 2) ? 8 : 0), c = 2 * (l & 3) + (q & 1) + ((q & 4) ? 8 : 0);
+     w[static_cast<size_t>(ob * 16 + r) * K + kb * 16 + c] = rec[i];
+ }
+-// a device copy of an F16W record tensor as plain fp16 (nullptr when absent); O = shape[0] * 16, K = shape[1] * 16
+-inline __half* f16w_plain(const bind::Tensor& t, int& O, int& K, cudaStream_t st)
+-{
+-    O = K = 0;
+-    if (!t.p) return nullptr;
+-    O = static_cast<int>(t.shape[0]) * 16; K = static_cast<int>(t.shape[1]) * 16;
+-    __half* w = nullptr;
+-    if (cudaMalloc(&w, static_cast<size_t>(O) * K * 2) != cudaSuccess) { fprintf(stderr, "bindp: ML4 plain fp16 copy: out of memory\n"); exit(1); }
+-    const long long n = static_cast<long long>(O) * K;
+-    k_f16w_plain<<<static_cast<unsigned>((n + 255) / 256), 256, 0, st>>>(static_cast<const __half*>(t.p), O, K, w);
+-    return w;
+-}
+-struct Ml4W                           // plain fp16 copies of one layer's F16W matrices (nullptr: the layer has none)
++// One layer's F16W matrices unpacked to plain fp16 into a lane's buffer just before the layer's GEMMs (ml4_unpack), instead of
++// a resident copy per layer (2.86 GB a rank): the same k_f16w_plain bytes, about 60 MB unpacked a layer
++struct Ml4W                           // the F16W records and their plain slots in the lane's buffer (nullptr: the layer has none)
+ {
+     __half *kv_a = nullptr, *iq = nullptr, *ik = nullptr, *iw = nullptr, *rt = nullptr;
++    const __half *kv_a_r = nullptr, *iq_r = nullptr, *ik_r = nullptr, *iw_r = nullptr, *rt_r = nullptr;
+     int kv_aO = 0, iqO = 0, ikO = 0, iwO = 0, rtO = 0;
+     size_t bytes() const { return static_cast<size_t>(kv_aO + iqO + ikO + iwO + rtO) * HID * 2; }
+ };
+-inline Ml4W ml4_plain(const bind::LayerTensors& T, cudaStream_t st)
++// buf = nullptr: the sizes only (bytes() is the buffer the layer needs); else the plain slots at buf, in this order
++inline Ml4W ml4_plain(const bind::LayerTensors& T, __half* buf)
+ {
+     Ml4W W;
+-    int K = 0;
+-    W.kv_a = f16w_plain(T.t[bind::T_ML4_KV_A], W.kv_aO, K, st);
+-    W.iq = f16w_plain(T.t[bind::T_ML4_IDX_WQ_B], W.iqO, K, st);
+-    W.ik = f16w_plain(T.t[bind::T_ML4_IDX_WK], W.ikO, K, st);
+-    W.iw = f16w_plain(T.t[bind::T_ML4_IDX_WPROJ], W.iwO, K, st);
+-    W.rt = f16w_plain(T.t[bind::T_ML4_ROUTER], W.rtO, K, st);
++    size_t at = 0;
++    auto one = [&](const bind::Tensor& t, const __half*& rec, __half*& w, int& O) {
++        if (!t.p) return;
++        if (static_cast<int>(t.shape[1]) * 16 != HID) { fprintf(stderr, "bindp: ML4 F16W matrix with K != %d\n", HID); exit(1); }
++        rec = static_cast<const __half*>(t.p); O = static_cast<int>(t.shape[0]) * 16;
++        if (buf) w = buf + at;
++        at += static_cast<size_t>(O) * HID;
++    };
++    one(T.t[bind::T_ML4_KV_A], W.kv_a_r, W.kv_a, W.kv_aO);
++    one(T.t[bind::T_ML4_IDX_WQ_B], W.iq_r, W.iq, W.iqO);
++    one(T.t[bind::T_ML4_IDX_WK], W.ik_r, W.ik, W.ikO);
++    one(T.t[bind::T_ML4_IDX_WPROJ], W.iw_r, W.iw, W.iwO);
++    one(T.t[bind::T_ML4_ROUTER], W.rt_r, W.rt, W.rtO);
+     return W;
+ }
++// the layer's matrices into its slots, on the stream its GEMMs run on (before the first of them)
++inline void ml4_unpack(const Ml4W& W, cudaStream_t st)
++{
++    auto one = [&](const __half* rec, __half* w, int O) {
++        if (!rec) return;
++        const long long n = static_cast<long long>(O) * HID;
++        k_f16w_plain<<<static_cast<unsigned>((n + 255) / 256), 256, 0, st>>>(rec, O, HID, w);
++    };
++    one(W.kv_a_r, W.kv_a, W.kv_aO); one(W.iq_r, W.iq, W.iqO); one(W.ik_r, W.ik, W.ikO);
++    one(W.iw_r, W.iw, W.iwO); one(W.rt_r, W.rt, W.rtO);
++}
+ struct Ml4Io
+ {
+     const __half* x = nullptr;        // in  [M][6144] attention_norm output
+@@ -6385,7 +6395,7 @@ inline const char* make_layer_ml4(const bind::LayerTensors& T, const Ml4W& W, in
+     if (M < 1 || M > sc.Mmax) return "M must be 1..Mmax of the scratch";
+     L.M = M;
+     L.moe = T.t[bind::T_TR3_TAB].p != nullptr;
+-    L.indexer = W.iq != nullptr;
++    L.indexer = W.iq_r != nullptr;
+     if (T.mats_err) return T.mats_err;
+     const dtr::LayerMats& D = T.mats;
+     if (!D.q_b.w || !D.o_proj.w || D.q_b.fmt != 1 || D.o_proj.fmt != 1) return "ML4 prefill: wq / wo are not K3 mul1 trellis matrices";
+diff --git a/engine/runtime/prefill.cuh b/engine/runtime/prefill.cuh
+index e2a23c5..aaa9ecf 100644
+--- a/engine/runtime/prefill.cuh
++++ b/engine/runtime/prefill.cuh
+@@ -501,7 +501,8 @@ struct Prefill
+     void (*dfl_tap)(Model&, Prefill&, int, int, cudaStream_t) = nullptr;   // --dflash: after layer i, keep the prompt rows the
+                                                                             //   drafter reads (dflash.cuh dfl_pf_tap_launch)
+ #if G6_MODEL_ML4
+-    std::vector<bindp::Ml4W> W4;                         // ML4: per layer, plain fp16 copies of the F16W matrices (cuBLAS)
++    std::vector<bindp::Ml4W> W4;                         // ML4: per layer, the F16W records and their slots in w4buf (cuBLAS)
++    __half* w4buf = nullptr;                             // ML4: this lane's plain fp16 of one layer's F16W matrices (ml4_unpack)
+     std::map<int, std::vector<bindp::Ml4Layer>> L4;      // ML4 bindings by row count
+     __half *q_raw = nullptr, *x_ln = nullptr, *attn_c = nullptr;   // [Mmax][H*128], [Mmax][6144], [Mmax][H*128]
+ #endif
+@@ -665,13 +666,14 @@ inline void build_prefill(Prefill& P, Model& m, const Find& find, int Mmax, cons
+     P.q_raw = dmalloc<__half>(n * g6nr::HMAX * 128);
+     P.x_ln = dmalloc<__half>(n * HID);
+     P.attn_c = dmalloc<__half>(n * g6nr::HMAX * 128);
+-    if (share) P.W4 = share->W4;
+-    else
+-    {
+-        size_t b = 0;
+-        for (const Layer& y : m.layers) { P.W4.push_back(bindp::ml4_plain(y.T, st)); b += P.W4.back().bytes(); }
+-        G6RT_CK(cudaStreamSynchronize(st));
+-        if (m.rank == 0) fprintf(stderr, "# rank %d: ML4 prefill fp16 copies of the F16W matrices for %d layers: %.3f GB\n", m.rank, m.nl, b / 1e9);
++    {   // each lane its own buffer (the two lanes run layers at once): one layer's F16W matrices, unpacked as the layer starts
++        size_t most = 0, all = 0;
++        for (const Layer& y : m.layers) { const size_t b = bindp::ml4_plain(y.T, nullptr).bytes(); most = std::max(most, b); all += b; }
++        P.w4buf = dmalloc<__half>(most / 2);
++        for (const Layer& y : m.layers) P.W4.push_back(bindp::ml4_plain(y.T, P.w4buf));
++        if (m.rank == 0 && !share)
++            fprintf(stderr, "# rank %d: ML4 prefill F16W matrices unpacked a layer at a time: %.1f MB a lane (resident copies would take %.3f GB)\n",
++                    m.rank, most / 1e6, all / 1e9);
+     }
+ #endif
+     if (P.qp) pf_qp_states(P, m, st, share);
+@@ -1312,6 +1314,7 @@ inline void pf_attn_block_ml4(Model& m, Prefill& P, int i, int M, int context, c
+     Layer& y = m.layers[i];
+     const bindp::Ml4Layer& b = pf_layer_ml4(m, P, i, M);
+     pf_mark(7, st);
++    bindp::ml4_unpack(P.W4[i], st);           // this layer's kv_a, indexer and router matrices into the lane's buffer
+     bindp::launch_ck(b.kv_a, st);             // off on KV-sharing layers
+     bindp::launch_ck(b.ik, st);
+     bindp::launch_ck(b.iw, st);
+-- 
+2.43.0
+

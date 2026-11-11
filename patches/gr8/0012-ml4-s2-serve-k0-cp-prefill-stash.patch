@@ -1,0 +1,449 @@
+From 80b23916d0f850c58141ef683123ef0e605febb1 Mon Sep 17 00:00:00 2001
+From: gr8-ml4 <benjamin.j.millar@gmail.com>
+Date: Mon, 9 Nov 2026 21:02:52 +0000
+Subject: [PATCH] ML4: S2 serve at --mtp 0 with the DSpark drafter; CP prefill
+ staging for KV-sharing layers
+
+- options.rs: ML4 --serve takes --mtp 0 with --dflash-manifest (and refuses --mtp N)
+- native.cuh / g6m4.cu / s2.cuh: no MTP draft Model at K = 0 (s2_models, s2_most, s2_place; capture_all K >= 0)
+- planner.rs: round_dfl skips the MTP first-form pass at K = 0
+- rank.cuh: the ML4 attention block compacts the S2 output (S2Model::cat) under S2
+- prefill.cuh: layer 35 staged latent -> a stash the KV-sharing layers read; their copy-back is index keys only
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ engine/runtime/g6m4.cu             | 38 +++++++++++-----------
+ engine/runtime/prefill.cuh         | 25 +++++++++++---
+ engine/runtime/rank.cuh            |  8 ++++-
+ engine/runtime/s2.cuh              |  5 +++
+ engine/runtime/s2/native.cuh       | 52 ++++++++++++++++--------------
+ engine/scheduler-rs/src/options.rs |  6 ++--
+ engine/scheduler-rs/src/planner.rs | 27 +++++++++-------
+ 7 files changed, 98 insertions(+), 63 deletions(-)
+
+diff --git a/engine/runtime/g6m4.cu b/engine/runtime/g6m4.cu
+index adfab02..32ac80c 100644
+--- a/engine/runtime/g6m4.cu
++++ b/engine/runtime/g6m4.cu
+@@ -922,10 +922,10 @@ int main(int argc, char** argv)
+                            knob::rt_check(), st);
+         }
+         s2_init(m, s2sess, st);
+-        s2_init(D.d, s2sess, st);
++        if (mtp) s2_init(D.d, s2sess, st);   // ML4 (--mtp 0): no draft Model
+         if (rtt && rtt->local)
+         {
+-            m.s2->rt_window = D.d.s2->rt_window = rtt->local;
++            for (Model* x : s2_models(m, D.d)) x->s2->rt_window = rtt->local;
+             RtTier* t = rtt.get();
+             m.s2->rt_tail = [t](const std::vector<int>& list) { return rt_tail_of(*t, list); };
+         }
+@@ -2143,7 +2143,7 @@ int main(int argc, char** argv)
+                         "the CP fabric is sized for it\n", cp_step, (unsigned long long)sc.cp_after, cp_step, cp_step / (mtp + 1), mtp + 1,
+                         sc.cp_seg ? ", and no session below R (GR8_CP_STEP_SEG)" : "");
+         }
+-        const int place = std::min(m.s2->pool_pages, D.d.s2->pool_pages);
++        const int place = s2_place(m, D.d);
+         g6s2::RunPool pool((uint32_t)(cap / 64), (uint32_t)place, (uint32_t)s2_below);
+         // the pool's R is the CP map's: a run past R takes its own pages — the prefix and its shard below place, the
+         // drafter's tail copy above it — instead of the whole pool, and retained runs keep their pages through a long
+@@ -2181,7 +2181,7 @@ int main(int argc, char** argv)
+         if (!kv_tiers.empty())
+         {
+             std::vector<const G6AttnBinding*> bs;
+-            for (Model* x : {&m, &D.d}) for (G6AttnBinding* b : x->s2->pool) bs.push_back(b);
++            for (Model* x : s2_models(m, D.d)) for (G6AttnBinding* b : x->s2->pool) bs.push_back(b);
+             size_t nidx = 0;
+             for (const G6AttnBinding* b : bs) nidx += b->args.index_cache != nullptr;
+             char host[64] = "host";
+@@ -2363,13 +2363,12 @@ int main(int argc, char** argv)
+                     if (pool.split())   // the run's own pages: its CP map over its list
+                     {
+                         const std::vector<int> run = pool.list(sl.run);
+-                        const int most = std::max(m.s2->pool_pages, D.d.s2->pool_pages);
+-                        s2_solo_cp_pages(m, run, most, m.s2->rp[sl.key.slot]);
+-                        s2_solo_cp_pages(D.d, run, most, m.s2->rp[sl.key.slot]);
++                        const int most = s2_most(m, D.d);
++                        for (Model* x : s2_models(m, D.d)) s2_solo_cp_pages(*x, run, most, m.s2->rp[sl.key.slot]);
+                     }
+-                    else { s2_solo_built(m); s2_solo_built(D.d); }
++                    else for (Model* x : s2_models(m, D.d)) s2_solo_built(*x);
+                 }
+-                else { const std::vector<int> run = pool.list(sl.run); s2_solo_pages(m, run); s2_solo_pages(D.d, run); }
++                else { const std::vector<int> run = pool.list(sl.run); for (Model* x : s2_models(m, D.d)) s2_solo_pages(*x, run); }
+                 m.s2_pf_table = D.d.s2_pf_table = !ex;
+                 // OWN=4: the offline loop's per-request rule (prompt + gen against the QO key table). The CP staging pool holds
+                 // S2 prefill rows by position, and the run's pages never reach the QO prepass.
+@@ -2457,7 +2456,7 @@ int main(int argc, char** argv)
+         int rt_ma = 0, rt_mb = 0;          // its rows on lane A and B
+         if (rtt && rtt->local)
+         {
+-            const int most = std::max(m.s2->pool_pages, D.d.s2->pool_pages);
++            const int most = s2_most(m, D.d);
+             rtt->write = [&, most](int q) {
+                 const S2Model& s = *m.s2;
+                 if (!s.ex_split[q]) return;
+@@ -2539,7 +2538,7 @@ int main(int argc, char** argv)
+                     const auto [lo, hi, lofree, hifree] = *v;
+                     std::string why = "it takes " + std::to_string(lo) + " pages below place (" + std::to_string(lofree) + " free) and its tail of " +
+                                       std::to_string(hi) + " above (" + std::to_string(hifree) + " free)";
+-                    if (hi > (uint64_t)(cap / 64 - std::min(m.s2->pool_pages, D.d.s2->pool_pages))) why += ": the tail is longer than the drafter class, it never fits";
++                    if (hi > (uint64_t)(cap / 64 - s2_place(m, D.d))) why += ": the tail is longer than the drafter class, it never fits";
+                     if ((int)pool.window_runs() >= rt_runs)
+                         why += "; the slot pool covers " + std::to_string(rt_runs) + " session(s) past R at once (GR8_RT_POOL), all in use";
+                     if (const auto iv = pool.ids_view(worst, r))
+@@ -2661,8 +2660,8 @@ int main(int argc, char** argv)
+                     // a prefix-reuse hit keeps the run's pages: rows below g.reuse are the retained session's, and every row
+                     // past them is written by this request before any step reads it (prefix_reuse.h)
+                     const std::vector<int> run = pool.list(g.run);
+-                    const int most = std::max(m.s2->pool_pages, D.d.s2->pool_pages);
+-                    for (Model* x : {&m, &D.d})
++                    const int most = s2_most(m, D.d);
++                    for (Model* x : s2_models(m, D.d))
+                     {
+                         if (ex)
+                         {
+@@ -2701,16 +2700,15 @@ int main(int argc, char** argv)
+                     rt_gc(*rtt, [&](const std::vector<int>& l) { return pool.is_kept(l); }, st);
+                     const int q = (int)k.key.slot, rp = (int)k.r_rows / 64, was_rp = m.s2->rp[q], win = rtt->local;
+                     const std::vector<int> was = m.s2->run[q], list = pool.list(k.run);
+-                    const int most = std::max(m.s2->pool_pages, D.d.s2->pool_pages);
++                    const int most = s2_most(m, D.d);
+                     std::vector<std::pair<int, int>> moves;
+                     for (int lp = rp; lp < was_rp; ++lp) moves.push_back({was[lp], list[rp + win + (lp - rp)]});
+-                    s2_copy_pages(D.d, moves, most, st);
++                    if (D.d.nl) s2_copy_pages(D.d, moves, most, st);
+                     rt_shrink(m, *rtt, q, was, list, (int)k.r_rows, (int)length - 1, st);
+-                    for (Model* x : {&m, &D.d}) s2_set_exclusive(*x, q, list, most, rp);
++                    for (Model* x : s2_models(m, D.d)) s2_set_exclusive(*x, q, list, most, rp);
+                     if (rt_layers == q)   // it runs alone: the layers' tables hold its run
+                     {
+-                        s2_solo_cp_pages(m, list, most, rp);
+-                        s2_solo_cp_pages(D.d, list, most, rp);
++                        for (Model* x : s2_models(m, D.d)) s2_solo_cp_pages(*x, list, most, rp);
+                     }
+                     G6RT_CK(cudaStreamSynchronize(st));
+                     if (R == 0) fprintf(stderr, "# rank 0: GR8_CP_R2: slot %d takes R %u, %d prefix pages back below place\n", q, k.r_rows, was_rp - rp);
+@@ -2721,7 +2719,7 @@ int main(int argc, char** argv)
+                     const std::vector<int> list = pool.list(r);
+                     if (rtt && list.size() > m.s2->run[q].size())   // the new pages are cleared: none may stay flagged
+                         rt_drop(*rtt, std::vector<int>(list.begin() + m.s2->run[q].size(), list.end()), st);
+-                    for (Model* x : {&m, &D.d})
++                    for (Model* x : s2_models(m, D.d))
+                     {
+                         const std::vector<int> old = x->s2->run[q];
+                         g6s2::require(list.size() > old.size() && std::equal(old.begin(), old.end(), list.begin()), "grown run does not extend the slot's pages");
+@@ -2892,7 +2890,7 @@ int main(int argc, char** argv)
+                 h.dfl_kv = dfl_k; h.dfl_spec = spec;
+                 // drafter choice: drafting ms per round at 2200 MHz. DFlash2: the drafter step and the MTP first form;
+                 // MTP: the first form, the drafter's context-only step, a chain step per draft after the first
+-                h.dsel.on = s2::dsel_env();
++                h.dsel.on = mtp && s2::dsel_env();   // ML4 (--mtp 0): DFlash2 only, nothing to choose
+                 // tuning (every rank must see the same values; the launcher's env reaches all of them)
+                 h.dsel.margin = knob::s2_dsel_margin();
+                 h.dsel.dwell = (int)std::max<int64_t>(1, knob::s2_dsel_dwell());
+diff --git a/engine/runtime/prefill.cuh b/engine/runtime/prefill.cuh
+index aaa9ecf..00c8a7f 100644
+--- a/engine/runtime/prefill.cuh
++++ b/engine/runtime/prefill.cuh
+@@ -2019,7 +2019,7 @@ __global__ void __launch_bounds__(CP_BACK_THREADS) k_cp_pf_back(const char* pool
+     if (pg == G6_CP_REMOTE) return;
+     const uint4* a = reinterpret_cast<const uint4*>(pool + (size_t)pos * CP_KVB);
+     uint4* d = reinterpret_cast<uint4*>(kv + ((size_t)pg * ps + pos % ps) * CP_KVB);
+-    if (threadIdx.x < CP_KVB / 16) d[threadIdx.x] = a[threadIdx.x];
++    if (kv && threadIdx.x < CP_KVB / 16) d[threadIdx.x] = a[threadIdx.x];   // kv null: index keys only (ML4 KV-sharing layer)
+     if (!ixoff) return;
+     const char* sp = pool + ixoff + (size_t)(pos / ps) * ps * CP_IXB;
+     char* dp = ix + (size_t)pg * ps * CP_IXB;
+@@ -2080,6 +2080,9 @@ inline void cp_pf_alloc(Model& m, cudaStream_t st, char* region = nullptr)
+     for (int k = 0; k < 2; ++k) m.cp.pf_pool[k] = region ? region + k * pool : dmalloc<char>(pool);
+     m.cp.pf_ixoff = pool > cp_pf_mla_bytes(m) ? cp_pf_mla_bytes(m) : 0;
+     m.cp.pf_ident = dmalloc<int>(a.table_size);
++#if G6_MODEL_ML4
++    m.cp.pf_stash = dmalloc<char>(cp_pf_mla_bytes(m));   // the KV-sharing layers' latent while staged (cp_pf_back)
++#endif
+     std::vector<int> id(a.table_size);
+     for (int k = 0; k < a.table_size; ++k) id[k] = k;
+     G6RT_CK(g6h2d::copy(m.cp.pf_ident, id.data(), id.size() * sizeof(int), st));
+@@ -2105,9 +2108,13 @@ inline void cp_pf_enter(Model& m)
+         G6Attn& a = m.layers[i].ab.args;
+         m.cp.pf_saved.push_back(a);
+         if (m.cp.pf_use[i] < 0) continue;   // no KV binding (a Flash KDA layer)
+-        a.mla_cache = m.cp.pf_pool[(m.cp.pf_g0 + m.cp.pf_use[i]) % 2]; a.block_table = m.cp.pf_ident; a.page_count = a.table_size; a.cp_nr = 0; a.cp_rank = 0;
++        char* const pool = m.cp.pf_pool[(m.cp.pf_g0 + m.cp.pf_use[i]) % 2];
++        a.mla_cache = pool; a.block_table = m.cp.pf_ident; a.page_count = a.table_size; a.cp_nr = 0; a.cp_rank = 0;
++#if G6_MODEL_ML4
++        if (!geom::owns_kv(m.layers[i].l)) a.mla_cache = m.cp.pf_stash;   // the source layer's staged latent (cp_pf_back)
++#endif
+         a.rt_page = nullptr; a.rt_group = nullptr;   // the staging pool's pages are not the pool's: no remote rows here
+-        if (m.cp.pf_ixon && a.index_cache) a.index_cache = (char*)a.mla_cache + m.cp.pf_ixoff;   // the staged index keys
++        if (m.cp.pf_ixon && a.index_cache) a.index_cache = pool + m.cp.pf_ixoff;   // the staged index keys
+ #ifdef DEC_S2
+         // S2 below R: the decode views read the run's index keys through its table, so the staged view does too
+         a.index_table = m.s2_pf_table ? m.cp.pf_saved.back().block_table : nullptr;
+@@ -2149,7 +2156,17 @@ inline void cp_pf_gather(Model& m, const CpPfSrc& s, int i, int start, cudaStrea
+ inline void cp_pf_back(Model& m, int i, int a0, int n, cudaStream_t st)
+ {
+     const G6Attn& a = m.cp.pf_saved[i];
+-    if (n > 0) k_cp_pf_back<<<n, CP_BACK_THREADS, 0, st>>>(m.cp.pf_pool[cp_pf_k(m, i)], (char*)a.mla_cache, a.block_table, a0, a.page_size, (char*)a.index_cache, cp_pf_ixoff(m, i));
++#if G6_MODEL_ML4
++    // ML4 KV sharing: the source layer's staged latent rows 0 .. a0 + n - 1 (all of them once the last lane appended) -> the
++    // stash the sharing layers read (cp_pf_enter); a sharing layer appended no latent, so only its index keys go back
++    const bool shared = !geom::owns_kv(m.layers[i].l);
++    if (!shared && m.cp.pf_stash && n > 0 && geom::kv_src(geom::L_MAIN - 1) == m.layers[i].l)
++        G6RT_CK(cudaMemcpyAsync(m.cp.pf_stash, m.cp.pf_pool[cp_pf_k(m, i)], (size_t)(a0 + n) * CP_KVB, cudaMemcpyDeviceToDevice, st));
++#else
++    const bool shared = false;
++#endif
++    if (n > 0) k_cp_pf_back<<<n, CP_BACK_THREADS, 0, st>>>(m.cp.pf_pool[cp_pf_k(m, i)], shared ? nullptr : (char*)a.mla_cache, a.block_table, a0,
++                                                          a.page_size, (char*)a.index_cache, cp_pf_ixoff(m, i));
+ }
+ // ---- real fabric (g6m4): the pools are the registered area of a bulk-mode Fabric, identical layout on
+ // every rank. Use g of pool k = g % 2: begin(g) = local fill of the pages I hold (lp < R/64 or my pages) + doorbell k;
+diff --git a/engine/runtime/rank.cuh b/engine/runtime/rank.cuh
+index e3d185d..070edf3 100644
+--- a/engine/runtime/rank.cuh
++++ b/engine/runtime/rank.cuh
+@@ -333,6 +333,7 @@ struct CpState
+     size_t pf_ixoff = 0;
+     bool pf_ixon = false;
+     int* pf_ident = nullptr;
++    char* pf_stash = nullptr;         // ML4: layer 35's staged latent after its prefill attention, which the KV-sharing layers read
+     std::vector<G6Attn> pf_saved;
+     bool pf_staged = false;
+     unsigned long long pf_g = 0;      // global pool-use counter: layer i of a sub-batch is use pf_g0 + pf_use[i], pool (use % 2)
+@@ -1257,6 +1258,7 @@ inline void put_publish(Model& m, const uint16_t* staging, int c, int M, cudaStr
+ 
+ #ifdef DEC_S2
+ inline void s2_attention(Model& m, int i, int M, cudaStream_t st);
++inline const __half* s2_attn_out(const Model& m);   // s2.cuh: the S2 step's attention output (S2Model::cat)
+ inline void s2_launch_cells(Model& m, cudaStream_t st);
+ inline StepEnd s2_step_end(Model& m, StepEnd e);
+ #endif
+@@ -1727,7 +1729,11 @@ inline void launch_attn_block_ml4(Model& m, int i, int M, int context, cudaStrea
+         G6RT_CK(g6_attn_bind_run(&y.ab, &s, st));
+     }
+     dmark(DP_ATTN, st);
+-    ml4::compact((const __half*)y.ab.args.output, b.heads, m.attn_c, M, st);
++    const __half* ao = (const __half*)y.ab.args.output;
++#ifdef DEC_S2
++    if (m.s2on) ao = s2_attn_out(m);          // S2: the sessions' attention output (s2.cuh: the views' output, per session copied)
++#endif
++    ml4::compact(ao, b.heads, m.attn_c, M, st);
+     bind::launch_o_proj(b, st);
+ #ifdef DEC_SLOT
+     slot_publish(m, 2 * i, st);
+diff --git a/engine/runtime/s2.cuh b/engine/runtime/s2.cuh
+index e3b2632..42d02ac 100644
+--- a/engine/runtime/s2.cuh
++++ b/engine/runtime/s2.cuh
+@@ -256,6 +256,10 @@ inline const G6Attn& s2_args0(const Model& m)
+         if (y.ab.storage) return y.ab.args;
+     die("s2: no attention binding");
+ }
++// the S2 models: the main one and the MTP draft (none at K = 0: ML4 serves with its DFlash2 drafter only, D.d unbuilt)
++inline std::vector<Model*> s2_models(Model& m, Model& d) { return d.nl ? std::vector<Model*>{&m, &d} : std::vector<Model*>{&m}; }
++inline int s2_most(const Model& m, const Model& d) { return d.nl ? std::max(m.s2->pool_pages, d.s2->pool_pages) : m.s2->pool_pages; }
++inline int s2_place(const Model& m, const Model& d) { return d.nl ? std::min(m.s2->pool_pages, d.s2->pool_pages) : m.s2->pool_pages; }
+ // once per model, after build, before any S2 step: nslots session slots (views on the pool). The layers' own bindings
+ // stay allocated but unused while s2on.
+ inline void s2_init(Model& m, int nslots, cudaStream_t st)
+@@ -776,6 +780,7 @@ inline const G6AttnReplay* s2_replay(Model& m, int i, int M)
+     return it == s.brp.end() ? nullptr : it->second.get();
+ }
+ 
++inline const __half* s2_attn_out(const Model& m) { return m.s2->cat; }
+ inline void s2_attention(Model& m, int i, int M, cudaStream_t st)
+ {
+     S2Model& s = *m.s2;
+diff --git a/engine/runtime/s2/native.cuh b/engine/runtime/s2/native.cuh
+index 6128a1d..395542d 100644
+--- a/engine/runtime/s2/native.cuh
++++ b/engine/runtime/s2/native.cuh
+@@ -208,30 +208,32 @@ class NativeDispatch {
+         }
+         return s;
+     }
++    // an MTP draft model (K >= 1); ML4 serves at K = 0 with its DFlash2 drafter only: no draft Model, no draft / chain steps
++    bool dr() const { return c_.draft.d.nl > 0; }
+     void mode(int old, int next) {
+         const auto t0 = std::chrono::steady_clock::now(); fence(); s2_tl().cut();
+-        if (old >= 0) g6rt::s2_hprev_from_solo(c_.draft,old,c_.stream);
++        if (old >= 0 && dr()) g6rt::s2_hprev_from_solo(c_.draft,old,c_.stream);
+         if (next >= 0) {
+             // the survivor's own pages (set by bind)
+             const std::vector<int>& run = c_.main.s2->run[next];
+             const bool ex = c_.main.s2->exclusive[next];
+-            require(!run.empty() && run == c_.draft.d.s2->run[next] && ex == c_.draft.d.s2->exclusive[next]
+-                     && c_.main.s2->ex_split[next] == c_.draft.d.s2->ex_split[next], "main/draft survivor runs differ");
++            require(!run.empty() && (!dr() || (run == c_.draft.d.s2->run[next] && ex == c_.draft.d.s2->exclusive[next]
++                     && c_.main.s2->ex_split[next] == c_.draft.d.s2->ex_split[next])), "main/draft survivor runs differ");
+             if (ex)
+             {
+                 // a run past R: on the pool's page classes its own list -> its CP map; the identity run -> the
+                 // tables as built. ex_split records which at bind (the pool's mode), not the list's shape
+                 if (c_.main.s2->ex_split[next])
+                 {
+-                    const int most = std::max(c_.main.s2->pool_pages, c_.draft.d.s2->pool_pages);
++                    const int most = dr() ? std::max(c_.main.s2->pool_pages, c_.draft.d.s2->pool_pages) : c_.main.s2->pool_pages;
+                     const int rp = c_.main.s2->rp[next];
+                     g6rt::s2_solo_cp_pages(c_.main, run, most, rp);
+-                    g6rt::s2_solo_cp_pages(c_.draft.d, run, most, rp);
++                    if (dr()) g6rt::s2_solo_cp_pages(c_.draft.d, run, most, rp);
+                 }
+-                else { g6rt::s2_solo_built(c_.main); g6rt::s2_solo_built(c_.draft.d); }
++                else { g6rt::s2_solo_built(c_.main); if (dr()) g6rt::s2_solo_built(c_.draft.d); }
+             }
+-            else { g6rt::s2_solo_pages(c_.main,run); g6rt::s2_solo_pages(c_.draft.d,run); }
+-            g6rt::s2_hprev_to_solo(c_.draft,next,c_.stream);
++            else { g6rt::s2_solo_pages(c_.main,run); if (dr()) g6rt::s2_solo_pages(c_.draft.d,run); }
++            if (dr()) g6rt::s2_hprev_to_solo(c_.draft,next,c_.stream);
+         }
+         c_.main.s2on = c_.draft.d.s2on = next < 0; fence();
+         fprintf(stderr,"# s2 mode rank %d solo %d -> %d: %.3f ms (tables + hprev; no KV relocation)\n",c_.main.rank,old,next,
+@@ -338,9 +340,11 @@ class NativeDispatch {
+         }
+         if (c_.pf_exit) c_.pf_exit();
+         fence(); prefill_sequence_ += c_.main.nl;
++        if (dr()) {
+         g6rt::pf_draft_inputs(dq,ma,payload.prompt.data()+a+1,pos.data());
+         g6rt::pf_draft(c_.draft,dq,p.x,ma,a+ma,c_.stream); fence();
+-        if (mb) {
++        }
++        if (mb && dr()) {
+             g6rt::pf_draft_inputs(dq,mb,payload.prompt.data()+a+ma+1,pos.data()+ma);
+             g6rt::pf_draft(c_.draft,dq,p2.x,mb,a+ma+mb,c_.stream); fence();
+         }
+@@ -352,7 +356,7 @@ class NativeDispatch {
+             // timed out, 0x65.. = the QO pair wire (qp_wire.h)
+             const unsigned f1 = *c_.prefill_fabric.dev().error, f2 = mb ? *c_.prefill_fabric2.dev().error : 0u;
+             int lm = -1, ld = -1;
+-            const unsigned am = g6rt::attn_errors_at(c_.main, &lm), ad = g6rt::attn_errors_at(c_.draft.d, &ld);
++            const unsigned am = g6rt::attn_errors_at(c_.main, &lm), ad = dr() ? g6rt::attn_errors_at(c_.draft.d, &ld) : 0u;
+             const unsigned ce = c_.extra_error ? c_.extra_error() : 0u;
+             if (f1 || f2 || am || ad || ce)
+                 fprintf(stderr,"# S2 prefill error words rank %d: fabric %08x/%08x attn main %08x (layer %d) draft %08x (layer %d) extra %08x "
+@@ -366,26 +370,26 @@ class NativeDispatch {
+ public:
+     explicit NativeDispatch(NativeContext c, const Config& scheduler) : c_(std::move(c)) {
+         scheduler.validate();
+-        require(c_.main.s2 && c_.draft.d.s2 && c_.main.graph && c_.draft.d.graph && c_.split == 3 && c_.split < c_.main.nl,
++        require(c_.main.s2 && (!dr() || (c_.draft.d.s2 && c_.draft.d.graph)) && c_.main.graph && c_.split == 3 && c_.split < c_.main.nl,
+                 "native S2 needs initialized pools and production split3 graphs");
+-        require(c_.prefill_rows > 0 && c_.input && c_.draft_input && c_.output && c_.draft_output &&
++        require(c_.prefill_rows > 0 && c_.input && c_.output && (!dr() || (c_.draft_input && c_.draft_output)) &&
+                 bool(c_.enqueue_main) && bool(c_.solo_main) && bool(c_.solo_draft) && bool(c_.begin_prefill) && bool(c_.end_prefill), "incomplete native context");
+         require(scheduler.max_rows <= g6rt::MX && scheduler.limit() <= unsigned(c_.main.s2->nslots) &&
+-                scheduler.limit() <= unsigned(c_.draft.d.s2->nslots) && scheduler.pool_rows / PAGE >= unsigned(c_.main.s2->pool_pages) &&
+-                scheduler.pool_rows / PAGE >= unsigned(c_.draft.d.s2->pool_pages) && // logical capacity >= physical (pool.h)
++                (!dr() || scheduler.limit() <= unsigned(c_.draft.d.s2->nslots)) && scheduler.pool_rows / PAGE >= unsigned(c_.main.s2->pool_pages) &&
++                (!dr() || scheduler.pool_rows / PAGE >= unsigned(c_.draft.d.s2->pool_pages)) && // logical capacity >= physical (pool.h)
+                 scheduler.prefill_rows == unsigned(c_.prefill_rows) &&
+                 scheduler.two_lanes == c_.two_lanes, "native storage/row/lane limits differ from advertised config");
+-        require(c_.main.in == c_.input && c_.draft.d.in == c_.draft_input && c_.main.out == c_.output && c_.draft.d.out == c_.draft_output,
++        require(c_.main.in == c_.input && c_.main.out == c_.output && (!dr() || (c_.draft.d.in == c_.draft_input && c_.draft.d.out == c_.draft_output)),
+                 "native staging pointers differ from captured model inputs");
+         G6RT_CK(cudaHostAlloc(reinterpret_cast<void**>(&layout_),sizeof(g6rt::S2In),cudaHostAllocMapped));
+         G6RT_CK(cudaHostAlloc(reinterpret_cast<void**>(&draft_layout_),sizeof(g6rt::S2In),cudaHostAllocMapped));
+         *layout_ = {}; *draft_layout_ = {};
+-        previous_layout_ = c_.main.s2->in; previous_draft_layout_ = c_.draft.d.s2->in;
+-        c_.main.s2->in = layout_; c_.draft.d.s2->in = draft_layout_;
++        previous_layout_ = c_.main.s2->in; c_.main.s2->in = layout_;
++        if (dr()) { previous_draft_layout_ = c_.draft.d.s2->in; c_.draft.d.s2->in = draft_layout_; }
+     }
+     ~NativeDispatch() {
+         for (auto& item:graphs_) destroy(item.second);
+-        c_.main.s2->in = previous_layout_; c_.draft.d.s2->in = previous_draft_layout_;
++        c_.main.s2->in = previous_layout_; if (dr()) c_.draft.d.s2->in = previous_draft_layout_;
+         cudaFreeHost(layout_); cudaFreeHost(draft_layout_);
+     }
+     NativeDispatch(const NativeDispatch&) = delete; NativeDispatch& operator=(const NativeDispatch&) = delete;
+@@ -405,23 +409,23 @@ public:
+     // fail as any uncaptured key does.
+     void capture_all(unsigned sessions, int mtp, int chunk, const s2::KStopB& kb = {}, int cp_rows = 0, int solo_kmax = 0) {
+         require(g6rt::S2_ATTN_LAYOUT_FREE, "boot capture needs the layout-free S2 attention: the graphs would bake the session layout");
+-        require(sessions >= 1 && sessions <= unsigned(g6rt::S2N) && mtp >= 1 && chunk >= 1 && chunk <= g6rt::MX, "invalid boot capture set");
++        require(sessions >= 1 && sessions <= unsigned(g6rt::S2N) && mtp >= (dr() ? 1 : 0) && chunk >= 1 && chunk <= g6rt::MX, "invalid boot capture set");
+         const int N = int(sessions), K = mtp, nbk = c_.main.nbk;
+-        require(nbk >= 1 && nbk == c_.draft.d.nbk && nbk <= g6rt::NBK, "main/draft context buckets differ");
++        require(nbk >= 1 && (!dr() || nbk == c_.draft.d.nbk) && nbk <= g6rt::NBK, "main/draft context buckets differ");
+         std::set<std::pair<int,int>> mains;   // (M, k1 class)
+         std::set<int> drafts, chains;
+-        for (int M = 1; M <= chunk; ++M) { mains.insert({M, s2::row_class(M)}); drafts.insert(M); }
++        for (int M = 1; M <= chunk; ++M) { mains.insert({M, s2::row_class(M)}); if (dr()) drafts.insert(M); }
+         for (int S = 1; S <= N; ++S)
+             for (int k = knob::s2_adapt() ? 1 : K; k <= K; ++k) mains.insert({S * (k + 1), s2::row_class(K + 1)});
+         for (int M : s2::kstopb_widths(kb, N, K)) mains.insert({M, s2::row_class(K + 1)});
+         for (int k = 1; k <= solo_kmax; ++k) mains.insert({k + 1, s2::row_class(k + 1)});   // s2_batch.h round_all, KStop::solo
+-        for (int M = 1; M <= N * (K + 1); ++M) drafts.insert(M);
+-        if (K >= 2) for (int M = 1; M <= N; ++M) chains.insert(M);
++        if (dr()) for (int M = 1; M <= N * (K + 1); ++M) drafts.insert(M);
++        if (dr() && K >= 2) for (int M = 1; M <= N; ++M) chains.insert(M);
+         for (const auto& mc : mains) require(mc.first <= g6rt::MX, "main step rows exceed G6_MX");
+         for (int M : drafts) require(M <= g6rt::MX, "draft step rows exceed G6_MX");
+         const auto t0 = std::chrono::steady_clock::now();
+         size_t free0 = 0, total = 0, free1 = 0; G6RT_CK(cudaMemGetInfo(&free0,&total));
+-        const bool on_main = c_.main.s2on, on_draft = c_.draft.d.s2on;
++        const bool on_main = c_.main.s2on, on_draft = c_.draft.d.s2on;   // (no draft Model: its flag only)
+         c_.main.s2on = c_.draft.d.s2on = true; fence();
+         size_t keys = 0, graphs = 0, cp_skipped = 0;
+         // one synthetic step: ns sessions of rows each (first form: one session of M rows; chain: M sessions of one row)
+diff --git a/engine/scheduler-rs/src/options.rs b/engine/scheduler-rs/src/options.rs
+index 21e6ab0..1a6a36d 100644
+--- a/engine/scheduler-rs/src/options.rs
++++ b/engine/scheduler-rs/src/options.rs
+@@ -1015,9 +1015,11 @@ pub fn parse(m: &ModuleInfo, api: &KnobApi, host: &Host, argv: &[Str]) -> Result
+             return Err("DS41 serving (--serve) needs --s2-port 1..65535, --s2-sessions 1..32 and --s2-epoch > 0 (no --prefill, --mtp 0; GR8_DS_MTP 1..5 is the DSpark draft); --graph is optional (without it each step runs eagerly)".into());
+         }
+     } else if s2mode
+-        && (!o.graph || mtp == 0 || mp == 0 || !(1..=65535).contains(&s2port) || !(1..=8).contains(&s2sess) || s2epoch == 0)
++        && (!o.graph || (mtp == 0 && !(ml4 && dfl)) || (ml4 && mtp != 0) || mp == 0 || !(1..=65535).contains(&s2port)
++            || !(1..=8).contains(&s2sess) || s2epoch == 0)
+     {
+-        return Err("serving (--serve) needs --graph, --mtp, --prefill, --s2-port 1..65535, --s2-sessions 1..8 and --s2-epoch > 0".into());
++        // ML4 has no MTP head: --mtp 0, the DSpark drafter (--dflash-manifest) drafts for a session alone, the others decode plainly
++        return Err("serving (--serve) needs --graph, --mtp (ML4: --mtp 0 with --dflash-manifest), --prefill, --s2-port 1..65535, --s2-sessions 1..8 and --s2-epoch > 0".into());
+     }
+     if s2mode {
+         let t = k.tests_set();
+diff --git a/engine/scheduler-rs/src/planner.rs b/engine/scheduler-rs/src/planner.rs
+index d4b3b33..6b6709f 100644
+--- a/engine/scheduler-rs/src/planner.rs
++++ b/engine/scheduler-rs/src/planner.rs
+@@ -1553,18 +1553,21 @@ impl<E: Engine> Batch<E> {
+             self.drafts(q, &r)?;
+         }
+         let dn = kept.min(a) + 1; // rows whose input the session committed
+-        self.sd.begin(DRAFT, cur_round, cur_active).event = ev;
+-        {
+-            let x = &self.st[qu];
+-            let b1 = (base + 1) as usize;
+-            self.sd.draft_rows(q, ev, base, &x.tokens, b1, dn as usize);
+-        }
+-        self.sd.cls = row_class(self.sd.m());
+-        self.check(&self.sd)?;
+-        run_step(&self.e, &self.sd, &mut self.td)?;
+-        self.st[qu].d[1] = self.td[(dn - 1) as usize];
+-        let lp = self.dlp(dn - 1)?;
+-        self.st[qu].dlm[1] = lp;
++        if self.k > 0 {
++            // K = 0 (ML4: the DFlash2 drafter alone, no MTP head): no first-form pass
++            self.sd.begin(DRAFT, cur_round, cur_active).event = ev;
++            {
++                let x = &self.st[qu];
++                let b1 = (base + 1) as usize;
++                self.sd.draft_rows(q, ev, base, &x.tokens, b1, dn as usize);
++            }
++            self.sd.cls = row_class(self.sd.m());
++            self.check(&self.sd)?;
++            run_step(&self.e, &self.sd, &mut self.td)?;
++            self.st[qu].d[1] = self.td[(dn - 1) as usize];
++            let lp = self.dlp(dn - 1)?;
++            self.st[qu].dlm[1] = lp;
++        }
+         if self.st[qu].force >= 0 {
+             // the insert cut this round: the drafter takes the rows as context, forced() drafts
+             let lo = self.st[qu].lo;
+-- 
+2.43.0
+

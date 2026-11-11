@@ -1,0 +1,661 @@
+From 250605594dcace7e2a5046315f9f000906c0f726 Mon Sep 17 00:00:00 2001
+From: grubbychicken <ben@grbychkn.com>
+Date: Mon, 9 Nov 2026 10:37:05 +0000
+Subject: [PATCH] ML4 W3/W4: dtr format 1 (K3 mul1, no E4M3) and the F16W GEMV
+ codec, G6_MODEL_ML4 only; dtr_ml4_test + dtr_ml4_ref.py
+
+---
+ engine/kernels/bind.cuh              |  18 ++-
+ engine/kernels/densev.cuh            |  18 +++
+ engine/kernels/dtr.cuh               |  68 ++++++++---
+ engine/kernels/l2pf.cuh              |   4 +-
+ engine/kernels/tests/dtr_ml4_test.cu | 173 +++++++++++++++++++++++++++
+ engine/ref/dtr_ml4_ref.py            | 157 ++++++++++++++++++++++++
+ 6 files changed, 413 insertions(+), 25 deletions(-)
+ create mode 100644 engine/kernels/tests/dtr_ml4_test.cu
+ create mode 100644 engine/ref/dtr_ml4_ref.py
+
+diff --git a/engine/kernels/bind.cuh b/engine/kernels/bind.cuh
+index 366accb..3e19fe4 100644
+--- a/engine/kernels/bind.cuh
++++ b/engine/kernels/bind.cuh
+@@ -524,7 +524,7 @@ inline void launch(const Xfrag& a, cudaStream_t st)
+ }
+ 
+ // ------------------------------------------------------------------------------------------ K2 + dense GEMVs
+-enum { INT4 = 0, MXFP8 = 1, BF16W = 2, FP8R = 3 };
++enum { INT4 = 0, MXFP8 = 1, BF16W = 2, FP8R = 3, F16W = 4 };   // F16W: G6_MODEL_ML4 builds only (densev.cuh)
+ 
+ struct Gv
+ {
+@@ -532,7 +532,7 @@ struct Gv
+     int codec = 0;
+     const uint8_t* w = nullptr;       // records [O/16][NG][GR]
+     const float* rscale = nullptr;    // [O] fp32 row scales for codec FP8R
+-    const u32* xfrag = nullptr;       // [K/16][32][2], BF16 fragments for codec BF16W
++    const u32* xfrag = nullptr;       // [K/16][32][2], BF16 fragments for codec BF16W, fp16 for the others
+     int K = 0, O = 0, tpc = 1, ks = 1, M = 0;
+     void* y = nullptr;                // [8][ld] of odt
+     int ld = 0, odt = gv::O_F16;
+@@ -566,6 +566,9 @@ inline void launch(const Gv& g, cudaStream_t st)
+         {
+             if (g.codec == INT4) { if constexpr (NTv == 1) go(gv_gemv_slot<Int4v, 1>, g.ld, g.slot); else if (b512) go(gv_gemv_slot_lb512<Int4v, NTv>, g.ld, g.slot); else go(gv_gemv_slot_lb<Int4v, NTv>, g.ld, g.slot); }
+             else if (g.codec == BF16W) { if constexpr (NTv == 1) go(gv_gemv_slot<Bf16w, 1>, g.ld, g.slot); else if (b512) go(gv_gemv_slot_lb512<Bf16w, NTv>, g.ld, g.slot); else go(gv_gemv_slot_lb<Bf16w, NTv>, g.ld, g.slot); }
++#if G6_MODEL_ML4
++            else if (g.codec == F16W) { if constexpr (NTv == 1) go(gv_gemv_slot<F16w, 1>, g.ld, g.slot); else if (b512) go(gv_gemv_slot_lb512<F16w, NTv>, g.ld, g.slot); else go(gv_gemv_slot_lb<F16w, NTv>, g.ld, g.slot); }
++#endif
+             else { if constexpr (NTv == 1) go(gv_gemv_slot<Mxfp8, 1>, g.ld, g.slot); else if (b512) go(gv_gemv_slot_lb512<Mxfp8, NTv>, g.ld, g.slot); else go(gv_gemv_slot_lb<Mxfp8, NTv>, g.ld, g.slot); }
+             return;
+         }
+@@ -573,6 +576,9 @@ inline void launch(const Gv& g, cudaStream_t st)
+         if (g.codec == INT4) { if constexpr (NTv == 1) go(gv_gemv<Int4v, 1>, g.y, g.ld, g.odt, g.rscale); else if (b512) go(gv_gemv_lb512<Int4v, NTv>, g.y, g.ld, g.odt, g.rscale); else go(gv_gemv_lb<Int4v, NTv>, g.y, g.ld, g.odt, g.rscale); }
+         else if (g.codec == MXFP8) { if constexpr (NTv == 1) go(gv_gemv<Mxfp8, 1>, g.y, g.ld, g.odt, g.rscale); else if (b512) go(gv_gemv_lb512<Mxfp8, NTv>, g.y, g.ld, g.odt, g.rscale); else go(gv_gemv_lb<Mxfp8, NTv>, g.y, g.ld, g.odt, g.rscale); }
+         else if (g.codec == FP8R) { if constexpr (NTv == 1) go(gv_gemv<Fp8r, 1>, g.y, g.ld, g.odt, g.rscale); else if (b512) go(gv_gemv_lb512<Fp8r, NTv>, g.y, g.ld, g.odt, g.rscale); else go(gv_gemv_lb<Fp8r, NTv>, g.y, g.ld, g.odt, g.rscale); }
++#if G6_MODEL_ML4
++        else if (g.codec == F16W) { if constexpr (NTv == 1) go(gv_gemv<F16w, 1>, g.y, g.ld, g.odt, g.rscale); else if (b512) go(gv_gemv_lb512<F16w, NTv>, g.y, g.ld, g.odt, g.rscale); else go(gv_gemv_lb<F16w, NTv>, g.y, g.ld, g.odt, g.rscale); }
++#endif
+         else { if constexpr (NTv == 1) go(gv_gemv<Bf16w, 1>, g.y, g.ld, g.odt, g.rscale); else if (b512) go(gv_gemv_lb512<Bf16w, NTv>, g.y, g.ld, g.odt, g.rscale); else go(gv_gemv_lb<Bf16w, NTv>, g.y, g.ld, g.odt, g.rscale); }
+     });
+ }
+@@ -589,7 +595,7 @@ inline void make_gv_multi(std::initializer_list<const Gv*> gs, int M, GvMulti& o
+ #ifdef DEC_SLOT
+         if (g->slot.send) { out = GvMulti(); return; }
+ #endif
+-        if (g->tpc * g->ks > 32 || out.n == GvMulti::MAXP) { out = GvMulti(); return; }
++        if (g->tpc * g->ks > 32 || out.n == GvMulti::MAXP || g->codec == F16W) { out = GvMulti(); return; }   // gv_multi has no F16W path
+         const int ot = g->O / 16;
+         out.p[out.n++] = GvPart{g->w, g->xfrag, g->y, g->codec, g->K, ot, g->tpc, g->ks, g->ld, g->odt, out.ctas};
+         out.ctas += (ot + g->tpc - 1) / g->tpc;
+@@ -606,7 +612,7 @@ inline const char* make_gv(const Tensor& t, int codec, int tpc, int ks, int M, c
+ {
+     g = Gv();
+     if (!t.p) return nullptr;
+-    const int GR = codec == INT4 ? 288 : codec == MXFP8 ? 528 : 512, gk = codec == BF16W ? 16 : 32;
++    const int GR = codec == INT4 ? 288 : codec == MXFP8 ? 528 : 512, gk = codec == BF16W || codec == F16W ? 16 : 32;
+     if (t.nd != 3 || t.shape[2] != GR) return "GEMV tensor is not a [O/16][NG][GR] record of its codec";
+     if (codec == FP8R && !rscale) return "FP8R GEMV requires row scales";
+     const int ng = static_cast<int>(t.shape[1]);
+@@ -630,7 +636,7 @@ inline void narrow(Gv& g, int t0, int nt, int tpc)
+ {
+     if (!g.on) return;
+     if (nt <= 0) { g.on = 0; return; }
+-    const int GR = g.codec == INT4 ? 288 : g.codec == MXFP8 ? 528 : 512, gk = g.codec == BF16W ? 16 : 32;
++    const int GR = g.codec == INT4 ? 288 : g.codec == MXFP8 ? 528 : 512, gk = g.codec == BF16W || g.codec == F16W ? 16 : 32;
+     const int esz = g.odt == gv::O_F32 ? 4 : 2;
+     g.w += static_cast<size_t>(t0) * (g.K / gk) * GR;
+     g.y = static_cast<char*>(g.y) + static_cast<size_t>(t0) * 16 * esz;
+@@ -1207,7 +1213,7 @@ inline size_t rec_bytes(const Tensor& t)
+ }
+ inline size_t gv_bytes(const Gv& g)
+ {
+-    const int GR = g.codec == INT4 ? 288 : g.codec == MXFP8 ? 528 : 512, gk = g.codec == BF16W ? 16 : 32;
++    const int GR = g.codec == INT4 ? 288 : g.codec == MXFP8 ? 528 : 512, gk = g.codec == BF16W || g.codec == F16W ? 16 : 32;
+     return g.on ? static_cast<size_t>(g.O / 16) * (g.K / gk) * GR : 0;
+ }
+ inline void warm(const Gv& g, cudaStream_t st) { if (g.on) launch_warm(g.w, gv_bytes(g), st); }
+diff --git a/engine/kernels/densev.cuh b/engine/kernels/densev.cuh
+index fafeedc..3a97d34 100644
+--- a/engine/kernels/densev.cuh
++++ b/engine/kernels/densev.cuh
+@@ -91,6 +91,24 @@ struct Bf16w
+     static __device__ __forceinline__ float2 scale(u32) { return make_float2(1.f, 1.f); }
+ };
+ 
++#if G6_MODEL_ML4
++// F16 weights in the BF16W record (one 16x16 tile of fp16 bits per group, 512 B, the same lane order), fp16 activation
++// fragments (xf_x, as MXFP8 and int4 read them), fp16 mma with fp32 accumulate. Mistral Large 4's kv_a, indexer, router
++// and head weights are fp16 values (bit-exact bf16 originals): BF16W would round the activations to bf16 (2^-9),
++// this keeps them at fp16 (2^-11).
++struct F16w
++{
++    static constexpr int G = 1, TW = 4, GR = 512, PFB = 4;
++    static constexpr bool SCALED = false, ROW_SCALED = false;
++    static __device__ __forceinline__ void ld_tile(const uint8_t* tile, int lane, u32* w) { gv::ld_nc_v4(tile + lane * 16, w); }
++    static __device__ __forceinline__ void dec(const u32* w, u32 (&a)[4]) { a[0] = w[0]; a[1] = w[1]; a[2] = w[2]; a[3] = w[3]; }
++    static __device__ __forceinline__ void mma_a(float (&g)[4], const u32 (&a)[4], u32 b0, u32 b1) { mma16816(g, a[0], a[1], a[2], a[3], b0, b1); }
++    static __device__ __forceinline__ void mma(float (&g)[4], const u32* w, u32 b0, u32 b1) { mma16816(g, w[0], w[1], w[2], w[3], b0, b1); }
++    static __device__ __forceinline__ u32 ld_scale(const uint8_t*, int) { return 0; }
++    static __device__ __forceinline__ float2 scale(u32) { return make_float2(1.f, 1.f); }
++};
++#endif
++
+ // int4 g32 W4A16 (the K2 / rt_record layout of rowtile.cuh) behind the same interface, so o_proj and the other
+ // D8 producers get the output dtype switch: gv_gemv<Int4v> with odt = O_BF16 writes a fabric partial directly.
+ struct Int4v
+diff --git a/engine/kernels/dtr.cuh b/engine/kernels/dtr.cuh
+index 1539e14..2bf8b63 100644
+--- a/engine/kernels/dtr.cuh
++++ b/engine/kernels/dtr.cuh
+@@ -45,6 +45,20 @@ enum { SIDE_OUT = 1, SIDE_IN = 2 };
+ enum { EPI_OUT = 0, EPI_GLU = 1 };
+ enum { O_F16 = 0, O_BF16 = 1, O_F32 = 2 };
+ constexpr int BITS = 4;               // the release stores every dense trellis matrix at K4
++// Formats of a dense trellis matrix (Mat::fmt, the kernels' F): 0 = the release's K4 with E4M3 rounding and the mcg
++// codebook (every model). Under G6_MODEL_ML4 also 1 = K3 with the mul1 codebook and no E4M3 rounding: the EXL3
++// 3.0 bpw pack of Mistral Large 4 (wq, wo, the layer 0 MLP), decoded exactly as ExLlamaV3 does. K6 (ML4's lm_head)
++// does not fit this kernel: a lane loads one word of a tile and a K6 tile has 48 (the head goes as F16W records,
++// docs/PORT.md). Builds without G6_MODEL_ML4 instantiate F = 0 only (the same kernels as before).
++#if G6_MODEL_ML4
++constexpr int NFMT = 2;
++#else
++constexpr int NFMT = 1;
++#endif
++__host__ __device__ constexpr int fbits(int f) { return f == 1 ? 3 : BITS; }
++__host__ __device__ constexpr bool fe4(int f) { return f == 0; }
++__host__ __device__ constexpr int fcb(int f) { return f == 0 ? TR3_MCG : TR3_MUL1; }
++static_assert(NFMT == 1 || tr3_cb_built(TR3_MUL1), "G6_MODEL_ML4 needs the mul1 codebook built (G6_TR3_CBS bit 1)");
+ constexpr int UNR = 16;               // tiles in flight per warp
+ constexpr int SMEM_MAX = 98304;       // dynamic shared memory attribute (init)
+ 
+@@ -78,10 +92,10 @@ __device__ __forceinline__ void ld4h(const __half* p, float (&v)[4])
+     v[0] = a.x; v[1] = a.y; v[2] = b.x; v[3] = b.y;
+ }
+ 
+-template <int NT, int SUB, bool ROT, int EPI>
++template <int NT, int SUB, bool ROT, int EPI, int F = 0>
+ __global__ void __launch_bounds__(256 * SUB, NT <= 2 ? (4 / SUB) : (2 / SUB)) k_dtr(Args a)
+ {
+-    constexpr int TB = 32 * BITS, NM = EPI == EPI_GLU ? 2 : 1, NW = 8 * SUB, DTR_UNR = 8;
++    constexpr int TB = 32 * fbits(F), NM = EPI == EPI_GLU ? 2 : 1, NW = 8 * SUB, DTR_UNR = 8;
+     extern __shared__ __align__(16) u32 sm[];
+     const int nblk = a.N >> 7;
+     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, j = warp & 7, q = warp >> 3;
+@@ -95,7 +109,7 @@ __global__ void __launch_bounds__(256 * SUB, NT <= 2 ? (4 / SUB) : (2 / SUB)) k_
+     const int g0 = s0 >> 3, ng = sw >> 3;
+     const uint8_t* wb = a.w[mat] + nb * a.sB + j * TB;
+     const uint8_t* gb = wb + g0 * a.sG;
+-    Tr3Lane<BITS, true> ld;
++    Tr3Lane<fbits(F), fe4(F), fcb(F)> ld;
+     ld.init(lane);
+     // the first 8-tile group is requested before the prologue, so its DRAM latency overlaps it
+     u32 na[DTR_UNR];
+@@ -330,9 +344,9 @@ struct Mat
+ {
+     const uint8_t* w = nullptr;
+     const __half *suh = nullptr, *svh = nullptr;
+-    int K = 0, N = 0, side = 0;
++    int K = 0, N = 0, side = 0, fmt = 0;
+     long long sB = 0, sG = 0;
+-    long long bytes() const { return static_cast<long long>(K) * N / 2; }    // K4
++    long long bytes() const { return static_cast<long long>(K) * N * fbits(fmt) / 8; }
+ };
+ 
+ template <class T> inline const char* make_mat(const T& ent, const T& suh, const T& svh, int side, Mat& m)
+@@ -345,8 +359,15 @@ template <class T> inline const char* make_mat(const T& ent, const T& suh, const
+     if (K % 128 || N % 128) return "dense trellis matrix: in and out widths must be multiples of 128";
+     if (side != SIDE_OUT && side != SIDE_IN) return "dense trellis matrix: side must be 1 (output entries) or 2 (input entries)";
+     if ((side == SIDE_OUT ? N : K) != E * 128) return "dense trellis matrix: entry count does not match the sharded side's width";
+-    const long long tb = 32 * BITS, want = static_cast<long long>(side == SIDE_OUT ? K : N) / 16 * 8 * tb;
+-    if (eb != want) return "dense trellis matrix: entry bytes are not a K4 entry of this shape (only K4 is supported)";
++    // the format from the entry size: K4 (fmt 0), or under G6_MODEL_ML4 K3 (mul1, fmt 1)
++    const long long per_bit = static_cast<long long>(side == SIDE_OUT ? K : N) / 16 * 8 * 32;
++    int fmt = -1;
++    for (int f = 0; f < NFMT; ++f)
++        if (eb == per_bit * fbits(f)) fmt = f;
++    if (fmt < 0) return NFMT == 1 ? "dense trellis matrix: entry bytes are not a K4 entry of this shape (only K4 is supported)"
++                                  : "dense trellis matrix: entry bytes are not a K4 or K3 entry of this shape";
++    const long long tb = 32 * fbits(fmt);
++    m.fmt = fmt;
+     m.w = static_cast<const uint8_t*>(ent.p);
+     m.suh = static_cast<const __half*>(suh.p);
+     m.svh = static_cast<const __half*>(svh.p);
+@@ -402,23 +423,31 @@ inline size_t part_floats(int N, int nm, int ks, int M) { return static_cast<siz
+ 
+ struct Gemv
+ {
+-    int on = 0, nt = 1, sub = 2, rot = 1, epi = EPI_OUT, side = 0;
++    int on = 0, nt = 1, sub = 2, rot = 1, epi = EPI_OUT, side = 0, fmt = 0;
+     Args a;
+     unsigned grid = 0;
+     size_t smem = 0;
+ };
+ 
+-// the instantiation of a launch (NT 1 .. g6mx::NT, SUB 1 | 2; ROT with EPI_OUT or EPI_GLU, !ROT with EPI_OUT)
+-template <int NT, int SUB> inline const void* pick3(int rot, int epi)
++// the instantiation of a launch (NT 1 .. g6mx::NT, SUB 1 | 2; ROT with EPI_OUT or EPI_GLU, !ROT with EPI_OUT; format F)
++template <int NT, int SUB, int F> inline const void* pick4(int rot, int epi)
++{
++    if (!rot) return reinterpret_cast<const void*>(k_dtr<NT, SUB, false, EPI_OUT, F>);
++    return epi == EPI_GLU ? reinterpret_cast<const void*>(k_dtr<NT, SUB, true, EPI_GLU, F>) : reinterpret_cast<const void*>(k_dtr<NT, SUB, true, EPI_OUT, F>);
++}
++template <int NT, int SUB> inline const void* pick3(int rot, int epi, int fmt)
+ {
+-    if (!rot) return reinterpret_cast<const void*>(k_dtr<NT, SUB, false, EPI_OUT>);
+-    return epi == EPI_GLU ? reinterpret_cast<const void*>(k_dtr<NT, SUB, true, EPI_GLU>) : reinterpret_cast<const void*>(k_dtr<NT, SUB, true, EPI_OUT>);
++    if constexpr (NFMT > 1)
++    {
++        if (fmt == 1) return pick4<NT, SUB, 1>(rot, epi);
++    }
++    return pick4<NT, SUB, 0>(rot, epi);
+ }
+-template <int NT> inline const void* pick2(int sub, int rot, int epi) { return sub == 2 ? pick3<NT, 2>(rot, epi) : pick3<NT, 1>(rot, epi); }
+-inline const void* kernel_of(int nt, int sub, int rot, int epi)
++template <int NT> inline const void* pick2(int sub, int rot, int epi, int fmt) { return sub == 2 ? pick3<NT, 2>(rot, epi, fmt) : pick3<NT, 1>(rot, epi, fmt); }
++inline const void* kernel_of(int nt, int sub, int rot, int epi, int fmt = 0)
+ {
+     const void* f = nullptr;
+-    g6mx::nt_dispatch(nt, [&](auto N) { f = pick2<decltype(N)::value>(sub, rot, epi); });
++    g6mx::nt_dispatch(nt, [&](auto N) { f = pick2<decltype(N)::value>(sub, rot, epi, fmt); });
+     return f;
+ }
+ 
+@@ -426,17 +455,18 @@ inline void launch(const Gemv& g, cudaStream_t st)
+ {
+     if (!g.on) return;
+     void* args[] = {const_cast<Args*>(&g.a)};
+-    cudaLaunchKernel(kernel_of(g.nt, g.sub, g.rot, g.epi), dim3(g.grid), dim3(256 * g.sub), args, g.smem, st);
++    cudaLaunchKernel(kernel_of(g.nt, g.sub, g.rot, g.epi, g.fmt), dim3(g.grid), dim3(256 * g.sub), args, g.smem, st);
+ }
+ 
+ // once per process, before the first launch or graph capture: every instantiation may use up to SMEM_MAX
+ inline cudaError_t init()
+ {
++    for (int f = 0; f < NFMT; ++f)
+     for (int nt = 1; nt <= g6mx::NT; ++nt)
+         for (int sub = 1; sub <= 2; ++sub)
+             for (int v = 0; v < 3; ++v)
+             {
+-                const cudaError_t e = cudaFuncSetAttribute(kernel_of(nt, sub, v != 0, v == 2 ? EPI_GLU : EPI_OUT),
++                const cudaError_t e = cudaFuncSetAttribute(kernel_of(nt, sub, v != 0, v == 2 ? EPI_GLU : EPI_OUT, f),
+                                                            cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+                 if (e != cudaSuccess) return e;
+             }
+@@ -528,6 +558,7 @@ inline const char* make_out(const Mat& m, int M, const __half* x, int ldx, const
+     if (ldy % 4) return "dense trellis GEMV: ldy must be a multiple of 4";
+     g.epi = EPI_OUT;
+     g.side = m.side;
++    g.fmt = m.fmt;
+     return fill(g, 1, M, ks, sub, x ? 1 : 0, sc, cnt_off);
+ }
+ 
+@@ -542,6 +573,7 @@ inline const char* make_glu(const Mat& gate, const Mat& up, const Mat& down, int
+     if (gate.side != SIDE_OUT || up.side != SIDE_OUT || down.side != SIDE_IN || gate.K != up.K || gate.N != up.N || down.K != gate.N ||
+         gate.sB != up.sB || gate.sG != up.sG)
+         return "dense trellis MLP shapes do not chain (gate, up [K -> I] side 1, down [I -> N] side 2)";
++    if (gate.fmt != up.fmt) return "dense trellis MLP: gate and up differ in format";
+     if (ldx % 4) return "dense trellis GEMV: ldx must be a multiple of 4";
+     Args& a = g.a;
+     a.w[0] = gate.w; a.w[1] = up.w; a.sB = gate.sB; a.sG = gate.sG; a.K = gate.K; a.N = gate.N;
+@@ -549,6 +581,7 @@ inline const char* make_glu(const Mat& gate, const Mat& up, const Mat& down, int
+     a.suh_d = down.suh; a.xd = xd;
+     g.epi = EPI_GLU;
+     g.side = SIDE_OUT;
++    g.fmt = gate.fmt;
+     return fill(g, 2, M, ks, sub, 1, sc, cnt_off);
+ }
+ 
+@@ -591,6 +624,7 @@ inline const char* make_fp8(const Mat& m, cudaStream_t st, Fp8& F)
+ {
+     F = Fp8();
+     if (!m.w) return nullptr;
++    if (m.fmt != 0) return "dtr make_fp8: only the K4 E4M3 format has an exact FP8 copy (ML4's mul1 matrices: the fp16 prefill path, docs/PORT.md M2)";
+     const size_t nc = static_cast<size_t>(m.N) * m.K;
+     if (cudaMalloc(&F.codes, nc) != cudaSuccess || cudaMalloc(&F.scales, nc / 32) != cudaSuccess) return "dtr make_fp8: cudaMalloc failed";
+     F.K = m.K; F.N = m.N;
+diff --git a/engine/kernels/l2pf.cuh b/engine/kernels/l2pf.cuh
+index 5746f4a..76d603b 100644
+--- a/engine/kernels/l2pf.cuh
++++ b/engine/kernels/l2pf.cuh
+@@ -241,7 +241,7 @@ inline Plan plan_layer(const bind::Layer& b, const void* uk, const void* uv, con
+     auto dtr_add = [&](int t, const dtr::Gemv& g, size_t cap) {
+         P.add(t, g.a.suh[0], static_cast<size_t>(g.a.K) * 2);
+         P.add(t, g.a.svh[0], static_cast<size_t>(g.a.N) * 2);
+-        const size_t n = static_cast<size_t>(g.a.K) * g.a.N * dtr::BITS / 8;
++        const size_t n = static_cast<size_t>(g.a.K) * g.a.N * dtr::fbits(g.fmt) / 8;
+         P.add(t, g.a.w[0], cap && cap < n ? cap : n);
+     };
+     if (b.q_b_t.on) dtr_add(T_QB, b.q_b_t, 0);
+@@ -258,7 +258,7 @@ inline Plan plan_layer(const bind::Layer& b, const void* uk, const void* uv, con
+     else if (b.o_proj.on) P.add(T_OPROJ, b.o_proj.w, opcap && opcap < bind::gv_bytes(b.o_proj) ? opcap : bind::gv_bytes(b.o_proj));
+     if (b.router.on) P.add(T_ROUTER, b.router.w, bind::gv_bytes(b.router));
+     if (b.shw) P.add(T_SHARED, b.shw, b.shw_bytes);
+-    else if (b.glu_t.on) { for (int k = 0; k < 2; ++k) P.add(T_SHARED, b.glu_t.a.w[k], static_cast<size_t>(b.glu_t.a.K) * b.glu_t.a.N * dtr::BITS / 8); }
++    else if (b.glu_t.on) { for (int k = 0; k < 2; ++k) P.add(T_SHARED, b.glu_t.a.w[k], static_cast<size_t>(b.glu_t.a.K) * b.glu_t.a.N * dtr::fbits(b.glu_t.fmt) / 8); }
+     else { for (int k = 0; k < 2; ++k) P.add(T_SHARED, b.sh[k].p, bind::rec_bytes(b.sh[k])); }
+     return P;
+ }
+diff --git a/engine/kernels/tests/dtr_ml4_test.cu b/engine/kernels/tests/dtr_ml4_test.cu
+new file mode 100644
+index 0000000..439fdd5
+--- /dev/null
++++ b/engine/kernels/tests/dtr_ml4_test.cu
+@@ -0,0 +1,173 @@
++// ML4 dense trellis matrices (dtr.cuh format 1: K3 mul1, no E4M3) on real pack slices: decode GEMV outputs for the
++// reference check (engine/ref/dtr_ml4_ref.py writes the inputs and checks the outputs against ExLlamaV3's weights).
++//
++//   nvcc -O2 -std=c++17 -gencode=arch=compute_121a,code=sm_121a -DG6_NR=4 -DDEC_S2 -DG6_MODEL_ML4=1 -I.. \
++//        -o dtr_ml4_test dtr_ml4_test.cu <knobs link flags as dtr_test>
++//   dtr_ml4_test DIR
++//
++// DIR/meta.txt, one line each:
++//   mat NAME SIDE K N R       NAME.codes.bin u8 [E][entry bytes], NAME.suh.bin f16 [K], NAME.svh.bin f16 [N],
++//                             NAME.x.bin f16 [R][K]
++//   glu GATE UP DOWN          gate and up on GATE.x.bin, then down (dtr::make_glu + make_out)
++//   gv NAME K O R             F16W GEMV (bind.cuh, G6_MODEL_ML4): NAME.rec.bin u8 [O/16][K/16][512] (fp16 weights in
++//                             the BF16W record order), NAME.x.bin f16 [R][K]; fp16 fragments by k_xfrag
++// Outputs: NAME.gemv.M<m>.bin, glu.gemv.M<m>.bin f32 [m][N], M = 1..G6_MX (up to R).
++#include <cstdio>
++#include <cstdlib>
++#include <fstream>
++#include <map>
++#include <sstream>
++#include <string>
++#include <vector>
++#include <cuda_bf16.h>
++#include "../bind.cuh"
++
++#define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { fprintf(stderr, "%s:%d %s: %s\n", __FILE__, __LINE__, #x, cudaGetErrorString(e_)); exit(1); } } while (0)
++static void die(const std::string& s) { fprintf(stderr, "error: %s\n", s.c_str()); exit(1); }
++static void ok(const char* e) { if (e) die(e); }
++static std::vector<uint8_t> slurp(const std::string& p)
++{
++    std::ifstream f(p, std::ios::binary);
++    if (!f) die("cannot read " + p);
++    return std::vector<uint8_t>((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
++}
++static void dump_dev(const std::string& p, const void* d, size_t n)
++{
++    std::vector<uint8_t> h(n);
++    CK(cudaMemcpy(h.data(), d, n, cudaMemcpyDeviceToHost));
++    FILE* f = fopen(p.c_str(), "wb");
++    if (!f || fwrite(h.data(), 1, n, f) != n) die("cannot write " + p);
++    fclose(f);
++}
++static void* up(const std::vector<uint8_t>& h)
++{
++    void* d;
++    CK(cudaMalloc(&d, h.size()));
++    CK(cudaMemcpy(d, h.data(), h.size(), cudaMemcpyHostToDevice));
++    return d;
++}
++struct View { const void* p = nullptr; int nd = 0; long long shape[4] = {}; };
++static View ten(const void* p, std::initializer_list<long long> s)
++{
++    View v; v.p = p; v.nd = static_cast<int>(s.size());
++    int i = 0;
++    for (long long x : s) v.shape[i++] = x;
++    return v;
++}
++struct HostMat { std::string name; int side, K, N, R, E; long long eb; void *codes, *suh, *svh, *x; dtr::Mat m; };
++
++int main(int argc, char** argv)
++{
++    if (argc < 2) die("usage: dtr_ml4_test DIR");
++    const std::string dir = argv[1];
++    CK(dtr::init());
++    std::map<std::string, HostMat> mats;
++    std::vector<std::vector<std::string>> glus;
++    struct HostGv { std::string name; int K, O, R; void *rec, *x; };
++    std::vector<HostGv> gvs;
++    std::ifstream meta(dir + "/meta.txt");
++    std::string line;
++    while (std::getline(meta, line))
++    {
++        std::istringstream is(line);
++        std::string kind;
++        is >> kind;
++        if (kind == "mat")
++        {
++            HostMat h;
++            is >> h.name >> h.side >> h.K >> h.N >> h.R;
++            const std::vector<uint8_t> c = slurp(dir + "/" + h.name + ".codes.bin");
++            h.E = (h.side == dtr::SIDE_OUT ? h.N : h.K) / 128;
++            h.eb = static_cast<long long>(c.size()) / h.E;
++            h.codes = up(c);
++            h.suh = up(slurp(dir + "/" + h.name + ".suh.bin"));
++            h.svh = up(slurp(dir + "/" + h.name + ".svh.bin"));
++            h.x = up(slurp(dir + "/" + h.name + ".x.bin"));
++            ok(dtr::make_mat(ten(h.codes, {h.E, h.eb}), ten(h.suh, {h.K}), ten(h.svh, {h.N}), h.side, h.m));
++            if (h.m.fmt != 1) die(h.name + ": not the K3 mul1 format (fmt " + std::to_string(h.m.fmt) + ")");
++            mats[h.name] = h;
++        }
++        else if (kind == "gv")
++        {
++            HostGv h;
++            is >> h.name >> h.K >> h.O >> h.R;
++            h.rec = up(slurp(dir + "/" + h.name + ".rec.bin"));
++            h.x = up(slurp(dir + "/" + h.name + ".x.bin"));
++            gvs.push_back(h);
++        }
++        else if (kind == "glu")
++        {
++            std::vector<std::string> g(3);
++            is >> g[0] >> g[1] >> g[2];
++            glus.push_back(g);
++        }
++    }
++    int maxN = 0;
++    for (auto& kv : mats) maxN = std::max(maxN, std::max(kv.second.N, kv.second.K));
++    dtr::Scratch sc;
++    sc.part_n = dtr::part_floats(maxN, 2, 64, G6_MX);
++    sc.cnt_n = 4096;
++    CK(cudaMalloc(&sc.part, sc.part_n * 4));
++    CK(cudaMalloc(&sc.cnt, sc.cnt_n * 4));
++    CK(cudaMemset(sc.cnt, 0, sc.cnt_n * 4));
++    float* y;
++    CK(cudaMalloc(&y, static_cast<size_t>(G6_MX) * maxN * 4));
++    cudaStream_t st;
++    CK(cudaStreamCreate(&st));
++    for (auto& kv : mats)
++    {
++        HostMat& h = kv.second;
++        for (int M = 1; M <= G6_MX && M <= h.R; ++M)
++        {
++            dtr::Gemv g;
++            ok(dtr::make_out(h.m, M, static_cast<const __half*>(h.x), h.K, nullptr, y, h.N, dtr::O_F32, sc, 0, 0, 1, g));
++            dtr::launch(g, st);
++            CK(cudaStreamSynchronize(st));
++            CK(cudaGetLastError());
++            dump_dev(dir + "/" + h.name + ".gemv.M" + std::to_string(M) + ".bin", y, static_cast<size_t>(M) * h.N * 4);
++        }
++        printf("%s: side %d K %d N %d, %d entries x %lld B (fmt %d): M = 1..%d dumped\n", h.name.c_str(), h.side, h.K, h.N,
++               h.E, h.eb, h.m.fmt, std::min(G6_MX, h.R));
++    }
++    for (const HostGv& h : gvs)
++    {
++        u32* xf;
++        float* yo;
++        CK(cudaMalloc(&xf, static_cast<size_t>(g6mx::NT) * (h.K / 16) * 64 * 4));
++        CK(cudaMalloc(&yo, static_cast<size_t>(G6_MX) * h.O * 4));
++        bind::Tensor t;
++        t.p = h.rec; t.nd = 3; t.shape[0] = h.O / 16; t.shape[1] = h.K / 16; t.shape[2] = 512;
++        for (int M = 1; M <= G6_MX && M <= h.R; ++M)
++        {
++            bind::Xfrag xa;
++            xa.on = 1; xa.src = static_cast<const __half*>(h.x); xa.ld = h.K; xa.K = h.K; xa.M = M; xa.f16 = xf;
++            bind::launch(xa, st);
++            bind::Gv g;
++            ok(bind::make_gv(t, bind::F16W, 1, 32, M, xf, yo, gv::O_F32, g));
++            bind::launch(g, st);
++            CK(cudaStreamSynchronize(st));
++            CK(cudaGetLastError());
++            dump_dev(dir + "/" + h.name + ".gemv.M" + std::to_string(M) + ".bin", yo, static_cast<size_t>(M) * h.O * 4);
++        }
++        printf("gv %s: F16W K %d O %d: M = 1..%d dumped\n", h.name.c_str(), h.K, h.O, std::min(G6_MX, h.R));
++    }
++    for (const auto& gl : glus)
++    {
++        HostMat &G = mats.at(gl[0]), &U = mats.at(gl[1]), &D = mats.at(gl[2]);
++        u32* xd;
++        CK(cudaMalloc(&xd, static_cast<size_t>(g6mx::NT) * (G.N / 16) * 64 * 4));
++        for (int M = 1; M <= G6_MX && M <= G.R; ++M)
++        {
++            dtr::Gemv a, b;
++            ok(dtr::make_glu(G.m, U.m, D.m, M, static_cast<const __half*>(G.x), G.K, xd, sc, 0, 0, 1, a));
++            ok(dtr::make_out(D.m, M, nullptr, 0, xd, y, D.N, dtr::O_F32, sc, 2048, 0, 1, b));
++            dtr::launch(a, st);
++            dtr::launch(b, st);
++            CK(cudaStreamSynchronize(st));
++            CK(cudaGetLastError());
++            dump_dev(dir + "/glu.gemv.M" + std::to_string(M) + ".bin", y, static_cast<size_t>(M) * D.N * 4);
++        }
++        printf("glu %s %s %s: M = 1..%d dumped\n", gl[0].c_str(), gl[1].c_str(), gl[2].c_str(), std::min(G6_MX, G.R));
++    }
++    return 0;
++}
+diff --git a/engine/ref/dtr_ml4_ref.py b/engine/ref/dtr_ml4_ref.py
+new file mode 100644
+index 0000000..0c4ecdb
+--- /dev/null
++++ b/engine/ref/dtr_ml4_ref.py
+@@ -0,0 +1,157 @@
++#!/usr/bin/env python3
++"""Inputs and the check for dtr_ml4_test (dtr.cuh format 1: ML4's EXL3 K3 mul1 matrices, rank 0 of TP4).
++
++  dtr_ml4_ref.py prep PACK_DIR EXL3_REF_DIR DIR    rank 0's slices of layer 5 wq (side 1, heads 0-15 = 2048 columns),
++                                                   layer 5 wo (side 2, rows 0-2047) and layer 0's dense MLP (channels
++                                                   0-6143: w1 gate, w3 up side 1, w2 down side 2) in dtr's entry
++                                                   layout, tiles copied as stored, + 8 random input rows each
++  dtr_ml4_ref.py check PACK_DIR EXL3_REF_DIR DIR   y = x @ W_eff (exl3_ref.dequant_exl3: ExLlamaV3's weights, fp32) for
++                                                   every dumped M; rel L2 per matrix, and whether row r's output is
++                                                   bit-identical for every M > r (row-count invariance)
++Also F16W GEMVs (bind.cuh codec F16W) on the layer 5 kv_a (576 rows of the 640 stored), router (128) and 2048 rows of
++the lm_head dequantized to fp16 once (the converter's form of ML4's head): y = x @ W.T against fp32.
++Entry layouts (dtr.cuh): side 1, entry e = output columns 128e..: trellis[:, 8e:8e+8] in [k16][c] order;
++side 2, entry e = input rows 128e..: trellis[8e:8e+8, 8b:8b+8] in [b][r][c] order.
++"""
++import json
++import os
++import struct
++import sys
++
++import numpy as np
++import torch
++
++mode, pack, refdir, D = sys.argv[1:5]
++sys.path.insert(0, refdir)
++import exl3_ref  # noqa: E402
++
++index = json.load(open(os.path.join(pack, 'model.safetensors.index.json')))['weight_map']
++DT = {'I16': np.int16, 'F16': np.float16, 'I32': np.int32}
++
++
++def raw(name):
++    f = os.path.join(pack, index[name])
++    with open(f, 'rb') as fh:
++        n = struct.unpack('<Q', fh.read(8))[0]
++        m = json.loads(fh.read(n))[name]
++        s, e = m['data_offsets']
++        fh.seek(8 + n + s)
++        return np.frombuffer(fh.read(e - s), DT[m['dtype']]).reshape(m['shape'])
++
++
++MATS = [  # name, pack prefix, side, sharded range (side 1: output columns, side 2: input rows)
++    ('wq5', 'layers.5.attention.wq', 1, (0, 2048)),
++    ('wo5', 'layers.5.attention.wo', 2, (0, 2048)),
++    ('g0', 'layers.0.feed_forward.w1', 1, (0, 6144)),
++    ('u0', 'layers.0.feed_forward.w3', 1, (0, 6144)),
++    ('d0', 'layers.0.feed_forward.w2', 2, (0, 6144)),
++]
++R = 8
++GVS = [('kva5', 'layers.5.attention.wkv_a_with_mqa.weight', 576), ('gate5', 'layers.5.gate.weight', 128), ('head', 'output', 2048)]
++
++
++def gv_order():
++    o = []
++    for l in range(32):
++        r, c = l // 4, l % 4
++        o += [(r, 2 * c), (r, 2 * c + 1), (r + 8, 2 * c), (r + 8, 2 * c + 1), (r, 2 * c + 8), (r, 2 * c + 9), (r + 8, 2 * c + 8), (r + 8, 2 * c + 9)]
++    return np.array(o)
++
++
++def f16_record(w):
++    """w fp16 [O][K] -> u8 [O/16][K/16][512]: one 16x16 tile per group in the GEMV lane order (records.rs bf16_record)."""
++    O, K = w.shape
++    o = gv_order()
++    t = w.reshape(O // 16, 16, K // 16, 16).transpose(0, 2, 1, 3)       # [ot][kt][r][c]
++    return np.ascontiguousarray(t[:, :, o[:, 0], o[:, 1]]).view(np.uint8)
++
++
++def gv_weight(pre, rows):
++    if pre == 'output':            # the 6-bit head: W_eff (ExLlamaV3's weight) to fp16, [rows][6144]
++        w = exl3_ref.dequant_exl3(torch.from_numpy(raw('output.trellis')[:, :rows // 16].copy()),
++                                  torch.from_numpy(raw('output.suh').copy()), torch.from_numpy(raw('output.svh')[:rows].copy()),
++                                  mul1=int(raw('output.mul1').reshape(-1)[0]))
++        return w.T.contiguous().half().numpy()
++    return raw(pre)[:rows].astype(np.float16)
++
++
++def slice_of(pre, side, lo, hi):
++    tr, suh, svh = raw(pre + '.trellis'), raw(pre + '.suh'), raw(pre + '.svh')
++    KT, NT, W = tr.shape
++    if side == 1:
++        ent = np.stack([tr[:, 8 * e:8 * e + 8] for e in range(lo // 128, hi // 128)])          # [E][k16][8][W]
++        return ent, suh, svh[lo:hi], KT * 16, hi - lo
++    ent = np.stack([tr[8 * e:8 * e + 8].reshape(8, NT // 8, 8, W).transpose(1, 0, 2, 3)        # [E][b][r][c][W]
++                    for e in range(lo // 128, hi // 128)])
++    return ent, suh[lo:hi], svh, hi - lo, NT * 16
++
++
++if mode == 'prep':
++    os.makedirs(D, exist_ok=True)
++    g = torch.Generator().manual_seed(5)
++    meta = []
++    for name, pre, side, (lo, hi) in MATS:
++        ent, suh, svh, K, N = slice_of(pre, side, lo, hi)
++        ent.astype(np.int16).tofile(os.path.join(D, name + '.codes.bin'))
++        suh.astype(np.float16).tofile(os.path.join(D, name + '.suh.bin'))
++        svh.astype(np.float16).tofile(os.path.join(D, name + '.svh.bin'))
++        if name == 'u0':      # make_glu runs gate and up on one input
++            x = np.fromfile(os.path.join(D, 'g0.x.bin'), np.float16)
++        else:
++            x = torch.randn(R, K, generator=g).half().numpy()
++        x.tofile(os.path.join(D, name + '.x.bin'))
++        meta.append(f'mat {name} {side} {K} {N} {R}')
++    meta.append('glu g0 u0 d0')
++    for name, pre, rows in GVS:
++        w = gv_weight(pre, rows)
++        f16_record(w).tofile(os.path.join(D, name + '.rec.bin'))
++        w.tofile(os.path.join(D, name + '.w.bin'))
++        torch.randn(R, w.shape[1], generator=g).half().numpy().tofile(os.path.join(D, name + '.x.bin'))
++        meta.append(f'gv {name} {w.shape[1]} {rows} {R}')
++    open(os.path.join(D, 'meta.txt'), 'w').write('\n'.join(meta) + '\n')
++    print('prep:', '; '.join(meta))
++    sys.exit(0)
++
++W = {}
++for name, pre, side, (lo, hi) in MATS:
++    w = exl3_ref.dequant_exl3(torch.from_numpy(raw(pre + '.trellis').copy()), torch.from_numpy(raw(pre + '.suh').copy()),
++                              torch.from_numpy(raw(pre + '.svh').copy()), mul1=int(raw(pre + '.mul1').reshape(-1)[0]))
++    W[name] = w[:, lo:hi] if side == 1 else w[lo:hi, :]
++bad = 0
++
++
++def check(label, ref, outs):
++    global bad
++    worst, inv = 0.0, True
++    for M, y in outs.items():
++        rel = float((torch.from_numpy(y) - ref[:M]).norm() / ref[:M].norm())
++        worst = max(worst, rel)
++    full = outs[max(outs)]
++    for M, y in outs.items():
++        inv &= bool(np.array_equal(y, full[:M]))
++    ok = worst <= 1e-3                 # the M1 gate (docs/PORT.md); row-count invariance is reported, gated at M3
++    bad |= not ok
++    print(f'{label}: rel L2 vs fp32 x @ W_eff, worst over M = 1..{max(outs)}: {worst:.3e} -> {"PASS" if ok else "FAIL"}; '
++          f'row r bit-identical for every M: {inv}' + ('' if inv else ' (split_for picks another k split per M: M3 item)'))
++
++
++def dumps(prefix, N):
++    out = {}
++    for M in range(1, R + 1):
++        p = os.path.join(D, f'{prefix}.gemv.M{M}.bin')
++        if os.path.exists(p):
++            out[M] = np.fromfile(p, np.float32).reshape(M, N)
++    return out
++
++
++for name, pre, side, (lo, hi) in MATS:
++    x = torch.from_numpy(np.fromfile(os.path.join(D, name + '.x.bin'), np.float16).reshape(R, -1).astype(np.float32))
++    check(f'{name} ({pre}, side {side})', x @ W[name], dumps(name, W[name].shape[1]))
++x = torch.from_numpy(np.fromfile(os.path.join(D, 'g0.x.bin'), np.float16).reshape(R, -1).astype(np.float32))
++a = torch.nn.functional.silu(x @ W['g0']) * (x @ W['u0'])
++check('glu g0 u0 d0 (layer 0 dense MLP, rank 0 channels)', a @ W['d0'], dumps('glu', W['d0'].shape[1]))
++for name, pre, rows in GVS:
++    w = torch.from_numpy(np.fromfile(os.path.join(D, name + '.w.bin'), np.float16).reshape(rows, -1).astype(np.float32))
++    x = torch.from_numpy(np.fromfile(os.path.join(D, name + '.x.bin'), np.float16).reshape(R, -1).astype(np.float32))
++    check(f'F16W {name} ({pre}, {rows} x {w.shape[1]})', x @ w.T, dumps(name, rows))
++sys.exit(1 if bad else 0)
+-- 
+2.43.0
+

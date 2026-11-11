@@ -1,0 +1,959 @@
+From 661ad66fb922b187be418fc9453dc8c6d7a11800 Mon Sep 17 00:00:00 2001
+From: grubbychicken <ben@grbychkn.com>
+Date: Mon, 9 Nov 2026 14:40:47 +0000
+Subject: [PATCH] ML4 M2: g6m4 runs ML4 on the TP4 ring; GR8_TEACHER_DUMP
+
+- module_info: G6_MODEL_ID_ML4 (name ml4, caps MTP0); options.rs and engine_options.h treat GR8_MOE_TOPK as
+  Flash-only for ML4 (its top-4 is routed in glue::k_router_plan_ml4)
+- g6m4: GR8_QA_SPLIT / GR8_IDXQ_SPLIT off and refused for ML4 (no q_a; its replicated GEMVs are not split yet)
+- GR8_TEACHER_DUMP=DIR (runtime/teacher_dump.h): offline teacher-forced scoring against a reference candidate list,
+  per rank the vocab slice LSE, max, argmax, next-token logit and K candidate logits per row
+
+Checked: M1 subset (layers 0,1,3,35,39) on the 4-box ring at chunk 4: every step line equal to m4sim and across ranks.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/ENV.md                            |   1 +
+ engine/knobs-rs/gr8_knob_ids.rs        | 123 +++++++++++------------
+ engine/knobs-rs/gr8_knobs.h            | 129 +++++++++++++------------
+ engine/module_info.h                   |   7 +-
+ engine/runtime/engine_options.h        |   2 +-
+ engine/runtime/g6m4.cu                 |  27 +++++-
+ engine/runtime/teacher_dump.h          |  73 ++++++++++++++
+ engine/scheduler-rs/src/module_info.rs |   1 +
+ engine/scheduler-rs/src/options.rs     |  11 ++-
+ knobs/serving.yaml                     |   9 ++
+ 10 files changed, 253 insertions(+), 130 deletions(-)
+ create mode 100644 engine/runtime/teacher_dump.h
+
+diff --git a/docs/ENV.md b/docs/ENV.md
+index 90d9676..da6dc71 100644
+--- a/docs/ENV.md
++++ b/docs/ENV.md
+@@ -429,6 +429,7 @@ These may differ between ranks: paths, per-box resources, logging and timing.
+ | `GR8_S2_TIMEOUT` | int | `120` | 1..86400 | S2: seconds the bootstrap waits on the control links before a rank gives up. |
+ | `GR8_S2_TRACE` | path | off |  | S2: writes a Chrome trace (chrome://tracing, ui.perfetto.dev) of this rank to PATH.r<rank>.json: a span per prefill quantum, prompt tail and decode step, and on the head each request's arrival, wait, admission, first token and finish, in wall-clock microseconds. tools/trace/merge.py joins the ranks and a client's request times. Host clock only. |
+ | `GR8_STEP_TMR` | flag | `0` |  | S2: prints a '# step_tmr' line per decode step with its launch and fence time in us, its graph key, rows and context. |
++| `GR8_TEACHER_DUMP` | path | unset |  | Offline runs, every --prompt one sequence of the same length S: reads DIR/ids.i32 (int32 [prompts][S][K], the reference's candidate ids per row) and writes DIR/r<rank>.tf, float32 [prompts][S][4 + K]: the rank's vocab slice log-sum-exp, maximum, argmax id, the next prompt token's logit, and the logits of the K ids (-inf outside the slice). Teacher-forced scoring against a reference (runtime/teacher_dump.h). Not with --serve. |
+ | `GR8_TEST_ZERO_DELAY_MS` | int | `0` |  | A test of the zeroing order: every dmalloc zeroing waits behind an N ms kernel on the legacy stream, so a write to new memory not ordered after it loses every time. |
+ | `TMPDIR` | path | `/tmp` |  | Where the loader writes its planned rank manifests. |
+ | `GR8_WEIGHT_CHECK` | flag | `1` |  | Sums each loaded image on the CPU and the GPU and stops the boot with exit 3 if they differ, then seals the sums for /health?deep (weight_check.cuh). 0 = off. |
+diff --git a/engine/knobs-rs/gr8_knob_ids.rs b/engine/knobs-rs/gr8_knob_ids.rs
+index 52d3c46..e4801bf 100644
+--- a/engine/knobs-rs/gr8_knob_ids.rs
++++ b/engine/knobs-rs/gr8_knob_ids.rs
+@@ -2,7 +2,7 @@
+ // change the table, not this file. Each knob's id in the C API of gr8_knobs.h; a NAME<n> family takes n as well.
+ 
+ /// The hash of the table these ids are from (gr8_knobs.h knob::TABLE_HASH).
+-pub const TABLE_HASH: u64 = 0x6b7b9b0a286a8a98;
++pub const TABLE_HASH: u64 = 0x6b3371c32d1c459b;
+ pub const ATTN_CTX2: u32 = 0;
+ pub const ATTN_CTX3: u32 = 1;
+ pub const ATTN_CTX3_HG: u32 = 2;
+@@ -421,63 +421,64 @@ pub const S2_TRACE: u32 = 414;
+ pub const SPEC_DRAFT: u32 = 415;
+ pub const SPEC_TABLE: u32 = 416;
+ pub const STEP_TMR: u32 = 417;
+-pub const TESTS: u32 = 418;
+-pub const TEST_CP_PF_BREAK: u32 = 419;
+-pub const TEST_CP_PF_NET: u32 = 420;
+-pub const TEST_DS41_KERNELS_DIR: u32 = 421;
+-pub const TEST_DS41_M4_PFW: u32 = 422;
+-pub const TEST_DS41_MGATE_DIAG: u32 = 423;
+-pub const TEST_DS41_TOKENIZER_DIR: u32 = 424;
+-pub const TEST_FUZZ_ROUNDS: u32 = 425;
+-pub const TEST_IDX_DUMP: u32 = 426;
+-pub const TEST_KVMAN_LEDGER: u32 = 427;
+-pub const TEST_KVSIM_ENTRIES: u32 = 428;
+-pub const TEST_KV_HASH: u32 = 429;
+-pub const TEST_KV_RANKS_CMP: u32 = 430;
+-pub const TEST_KV_TIER_CHECK: u32 = 431;
+-pub const TEST_KV_TIER_CHECK_DROP: u32 = 432;
+-pub const TEST_LEDGER_CRASH_AT: u32 = 433;
+-pub const TEST_MTP_LASTROW_CHECK: u32 = 434;
+-pub const TEST_PERTURB: u32 = 435;
+-pub const TEST_PF_DRAFTDUMP: u32 = 436;
+-pub const TEST_PF_HASH_POKE: u32 = 437;
+-pub const TEST_PF_REPLAY_VERBOSE: u32 = 438;
+-pub const TEST_PF_RESDUMP: u32 = 439;
+-pub const TEST_PF_TIMES: u32 = 440;
+-pub const TEST_ROW_LINES: u32 = 441;
+-pub const TEST_RT_ADOPT_SLOT: u32 = 442;
+-pub const TEST_RT_POISON: u32 = 443;
+-pub const TEST_S2_ATTN_PERSESSION: u32 = 444;
+-pub const TEST_S2_CLS: u32 = 445;
+-pub const TEST_S2_GEN: u32 = 446;
+-pub const TEST_S2_GROW_POOL: u32 = 447;
+-pub const TEST_S2_INSERT: u32 = 448;
+-pub const TEST_S2_PAGES: u32 = 449;
+-pub const TEST_S2_PFBASE: u32 = 450;
+-pub const TEST_S2_PFNOFIX: u32 = 451;
+-pub const TEST_S2_PFPOISON: u32 = 452;
+-pub const TEST_S2_POOL: u32 = 453;
+-pub const TEST_S2_RELOC: u32 = 454;
+-pub const TEST_S2_RELOC_PAGES: u32 = 455;
+-pub const TEST_S2_ROWHASH: u32 = 456;
+-pub const TEST_S2_RUNS: u32 = 457;
+-pub const TEST_S2_SHRINK_AT: u32 = 458;
+-pub const TEST_S2_SOLO1: u32 = 459;
+-pub const TEST_S2_XLIST: u32 = 460;
+-pub const TEST_TOKENIZER_DIR: u32 = 461;
+-pub const TEST_VISION_CASES: u32 = 462;
+-pub const TEST_ZERO_DELAY_MS: u32 = 463;
+-pub const TMPDIR: u32 = 464;
+-pub const TR3_W2ALL: u32 = 465;
+-pub const V2_SHARED: u32 = 466;
+-pub const WARM: u32 = 467;
+-pub const WEIGHT_CHECK: u32 = 468;
+-pub const WEIGHT_CHECK_FLIP: u32 = 469;
+-pub const WIDTHS: u32 = 470;
+-pub const WORK_DIR: u32 = 471;
+-pub const XGRAMMAR: u32 = 472;
+-pub const XGRAMMAR_LIB: u32 = 473;
+-pub const XTRACE: u32 = 474;
+-pub const XTRACE_OUT: u32 = 475;
+-pub const XTRACE_PF: u32 = 476;
+-pub const XTRACE_QUIT: u32 = 477;
++pub const TEACHER_DUMP: u32 = 418;
++pub const TESTS: u32 = 419;
++pub const TEST_CP_PF_BREAK: u32 = 420;
++pub const TEST_CP_PF_NET: u32 = 421;
++pub const TEST_DS41_KERNELS_DIR: u32 = 422;
++pub const TEST_DS41_M4_PFW: u32 = 423;
++pub const TEST_DS41_MGATE_DIAG: u32 = 424;
++pub const TEST_DS41_TOKENIZER_DIR: u32 = 425;
++pub const TEST_FUZZ_ROUNDS: u32 = 426;
++pub const TEST_IDX_DUMP: u32 = 427;
++pub const TEST_KVMAN_LEDGER: u32 = 428;
++pub const TEST_KVSIM_ENTRIES: u32 = 429;
++pub const TEST_KV_HASH: u32 = 430;
++pub const TEST_KV_RANKS_CMP: u32 = 431;
++pub const TEST_KV_TIER_CHECK: u32 = 432;
++pub const TEST_KV_TIER_CHECK_DROP: u32 = 433;
++pub const TEST_LEDGER_CRASH_AT: u32 = 434;
++pub const TEST_MTP_LASTROW_CHECK: u32 = 435;
++pub const TEST_PERTURB: u32 = 436;
++pub const TEST_PF_DRAFTDUMP: u32 = 437;
++pub const TEST_PF_HASH_POKE: u32 = 438;
++pub const TEST_PF_REPLAY_VERBOSE: u32 = 439;
++pub const TEST_PF_RESDUMP: u32 = 440;
++pub const TEST_PF_TIMES: u32 = 441;
++pub const TEST_ROW_LINES: u32 = 442;
++pub const TEST_RT_ADOPT_SLOT: u32 = 443;
++pub const TEST_RT_POISON: u32 = 444;
++pub const TEST_S2_ATTN_PERSESSION: u32 = 445;
++pub const TEST_S2_CLS: u32 = 446;
++pub const TEST_S2_GEN: u32 = 447;
++pub const TEST_S2_GROW_POOL: u32 = 448;
++pub const TEST_S2_INSERT: u32 = 449;
++pub const TEST_S2_PAGES: u32 = 450;
++pub const TEST_S2_PFBASE: u32 = 451;
++pub const TEST_S2_PFNOFIX: u32 = 452;
++pub const TEST_S2_PFPOISON: u32 = 453;
++pub const TEST_S2_POOL: u32 = 454;
++pub const TEST_S2_RELOC: u32 = 455;
++pub const TEST_S2_RELOC_PAGES: u32 = 456;
++pub const TEST_S2_ROWHASH: u32 = 457;
++pub const TEST_S2_RUNS: u32 = 458;
++pub const TEST_S2_SHRINK_AT: u32 = 459;
++pub const TEST_S2_SOLO1: u32 = 460;
++pub const TEST_S2_XLIST: u32 = 461;
++pub const TEST_TOKENIZER_DIR: u32 = 462;
++pub const TEST_VISION_CASES: u32 = 463;
++pub const TEST_ZERO_DELAY_MS: u32 = 464;
++pub const TMPDIR: u32 = 465;
++pub const TR3_W2ALL: u32 = 466;
++pub const V2_SHARED: u32 = 467;
++pub const WARM: u32 = 468;
++pub const WEIGHT_CHECK: u32 = 469;
++pub const WEIGHT_CHECK_FLIP: u32 = 470;
++pub const WIDTHS: u32 = 471;
++pub const WORK_DIR: u32 = 472;
++pub const XGRAMMAR: u32 = 473;
++pub const XGRAMMAR_LIB: u32 = 474;
++pub const XTRACE: u32 = 475;
++pub const XTRACE_OUT: u32 = 476;
++pub const XTRACE_PF: u32 = 477;
++pub const XTRACE_QUIT: u32 = 478;
+diff --git a/engine/knobs-rs/gr8_knobs.h b/engine/knobs-rs/gr8_knobs.h
+index 45fd304..a67616b 100644
+--- a/engine/knobs-rs/gr8_knobs.h
++++ b/engine/knobs-rs/gr8_knobs.h
+@@ -27,7 +27,7 @@ namespace knob
+ {
+ 
+ /// The hash of the table this header was written from.
+-constexpr uint64_t TABLE_HASH = 0x6b7b9b0a286a8a98ull;
++constexpr uint64_t TABLE_HASH = 0x6b3371c32d1c459bull;
+ 
+ /// Prints the environment's problems (bad values, unknown GR8_ names, old G6_ names) to stderr and returns the number
+ /// of errors. The engine stops when it is not 0.
+@@ -3003,423 +3003,430 @@ inline bool step_tmr()
+     return v;
+ }
+ 
++/// GR8_TEACHER_DUMP
++inline const std::optional<std::string>& teacher_dump()
++{
++    static const std::optional<std::string> v = detail::text(418, 0);
++    return v;
++}
++
+ /// GR8_TESTS
+ inline const std::string& tests()
+ {
+-    static const std::string v = *detail::text(418, 0);
++    static const std::string v = *detail::text(419, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_CP_PF_BREAK
+ inline const std::optional<std::string>& test_cp_pf_break()
+ {
+-    static const std::optional<std::string> v = detail::text(419, 0);
++    static const std::optional<std::string> v = detail::text(420, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_CP_PF_NET
+ inline bool test_cp_pf_net()
+ {
+-    static const bool v = *detail::flag(420, 0);
++    static const bool v = *detail::flag(421, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_DS41_KERNELS_DIR
+ inline const std::optional<std::string>& test_ds41_kernels_dir()
+ {
+-    static const std::optional<std::string> v = detail::text(421, 0);
++    static const std::optional<std::string> v = detail::text(422, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_DS41_M4_PFW
+ inline int64_t test_ds41_m4_pfw()
+ {
+-    static const int64_t v = *detail::int_(422, 0);
++    static const int64_t v = *detail::int_(423, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_DS41_MGATE_DIAG
+ inline bool test_ds41_mgate_diag()
+ {
+-    static const bool v = *detail::flag(423, 0);
++    static const bool v = *detail::flag(424, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_DS41_TOKENIZER_DIR
+ inline const std::optional<std::string>& test_ds41_tokenizer_dir()
+ {
+-    static const std::optional<std::string> v = detail::text(424, 0);
++    static const std::optional<std::string> v = detail::text(425, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_FUZZ_ROUNDS
+ inline int64_t test_fuzz_rounds()
+ {
+-    static const int64_t v = *detail::int_(425, 0);
++    static const int64_t v = *detail::int_(426, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_IDX_DUMP
+ inline const std::optional<std::string>& test_idx_dump()
+ {
+-    static const std::optional<std::string> v = detail::text(426, 0);
++    static const std::optional<std::string> v = detail::text(427, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_KVMAN_LEDGER
+ inline const std::string& test_kvman_ledger()
+ {
+-    static const std::string v = *detail::text(427, 0);
++    static const std::string v = *detail::text(428, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_KVSIM_ENTRIES
+ inline bool test_kvsim_entries()
+ {
+-    static const bool v = *detail::flag(428, 0);
++    static const bool v = *detail::flag(429, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_KV_HASH
+ inline bool test_kv_hash()
+ {
+-    static const bool v = *detail::flag(429, 0);
++    static const bool v = *detail::flag(430, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_KV_RANKS_CMP
+ inline bool test_kv_ranks_cmp()
+ {
+-    static const bool v = *detail::flag(430, 0);
++    static const bool v = *detail::flag(431, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_KV_TIER_CHECK
+ inline const std::optional<std::string>& test_kv_tier_check()
+ {
+-    static const std::optional<std::string> v = detail::text(431, 0);
++    static const std::optional<std::string> v = detail::text(432, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_KV_TIER_CHECK_DROP
+ inline std::optional<int64_t> test_kv_tier_check_drop()
+ {
+-    static const std::optional<int64_t> v = detail::int_(432, 0);
++    static const std::optional<int64_t> v = detail::int_(433, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_LEDGER_CRASH_AT
+ inline const std::optional<std::string>& test_ledger_crash_at()
+ {
+-    static const std::optional<std::string> v = detail::text(433, 0);
++    static const std::optional<std::string> v = detail::text(434, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_MTP_LASTROW_CHECK
+ inline bool test_mtp_lastrow_check()
+ {
+-    static const bool v = *detail::flag(434, 0);
++    static const bool v = *detail::flag(435, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_PERTURB
+ inline double test_perturb()
+ {
+-    static const double v = *detail::float_(435, 0);
++    static const double v = *detail::float_(436, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_PF_DRAFTDUMP
+ inline const std::optional<std::string>& test_pf_draftdump()
+ {
+-    static const std::optional<std::string> v = detail::text(436, 0);
++    static const std::optional<std::string> v = detail::text(437, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_PF_HASH_POKE
+ inline const std::optional<std::vector<int64_t>>& test_pf_hash_poke()
+ {
+-    static const std::optional<std::vector<int64_t>> v = detail::ints(437, 0);
++    static const std::optional<std::vector<int64_t>> v = detail::ints(438, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_PF_REPLAY_VERBOSE
+ inline bool test_pf_replay_verbose()
+ {
+-    static const bool v = *detail::flag(438, 0);
++    static const bool v = *detail::flag(439, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_PF_RESDUMP
+ inline const std::optional<std::string>& test_pf_resdump()
+ {
+-    static const std::optional<std::string> v = detail::text(439, 0);
++    static const std::optional<std::string> v = detail::text(440, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_PF_TIMES
+ inline bool test_pf_times()
+ {
+-    static const bool v = *detail::flag(440, 0);
++    static const bool v = *detail::flag(441, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_ROW_LINES
+ inline bool test_row_lines()
+ {
+-    static const bool v = *detail::flag(441, 0);
++    static const bool v = *detail::flag(442, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_RT_ADOPT_SLOT
+ inline bool test_rt_adopt_slot()
+ {
+-    static const bool v = *detail::flag(442, 0);
++    static const bool v = *detail::flag(443, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_RT_POISON
+ inline bool test_rt_poison()
+ {
+-    static const bool v = *detail::flag(443, 0);
++    static const bool v = *detail::flag(444, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_S2_ATTN_PERSESSION
+ inline bool test_s2_attn_persession()
+ {
+-    static const bool v = *detail::flag(444, 0);
++    static const bool v = *detail::flag(445, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_S2_CLS
+ inline int64_t test_s2_cls()
+ {
+-    static const int64_t v = *detail::int_(445, 0);
++    static const int64_t v = *detail::int_(446, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_S2_GEN
+ inline const std::optional<std::vector<int64_t>>& test_s2_gen()
+ {
+-    static const std::optional<std::vector<int64_t>> v = detail::ints(446, 0);
++    static const std::optional<std::vector<int64_t>> v = detail::ints(447, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_S2_GROW_POOL
+ inline std::optional<int64_t> test_s2_grow_pool()
+ {
+-    static const std::optional<int64_t> v = detail::int_(447, 0);
++    static const std::optional<int64_t> v = detail::int_(448, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_S2_INSERT
+ inline const std::optional<std::string>& test_s2_insert()
+ {
+-    static const std::optional<std::string> v = detail::text(448, 0);
++    static const std::optional<std::string> v = detail::text(449, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_S2_PAGES
+ inline const std::optional<std::vector<int64_t>>& test_s2_pages()
+ {
+-    static const std::optional<std::vector<int64_t>> v = detail::ints(449, 0);
++    static const std::optional<std::vector<int64_t>> v = detail::ints(450, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_S2_PFBASE
+ inline const std::optional<std::vector<int64_t>>& test_s2_pfbase()
+ {
+-    static const std::optional<std::vector<int64_t>> v = detail::ints(450, 0);
++    static const std::optional<std::vector<int64_t>> v = detail::ints(451, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_S2_PFNOFIX
+ inline bool test_s2_pfnofix()
+ {
+-    static const bool v = *detail::flag(451, 0);
++    static const bool v = *detail::flag(452, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_S2_PFPOISON
+ inline bool test_s2_pfpoison()
+ {
+-    static const bool v = *detail::flag(452, 0);
++    static const bool v = *detail::flag(453, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_S2_POOL
+ inline std::optional<int64_t> test_s2_pool()
+ {
+-    static const std::optional<int64_t> v = detail::int_(453, 0);
++    static const std::optional<int64_t> v = detail::int_(454, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_S2_RELOC
+ inline bool test_s2_reloc()
+ {
+-    static const bool v = *detail::flag(454, 0);
++    static const bool v = *detail::flag(455, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_S2_RELOC_PAGES
+ inline std::optional<int64_t> test_s2_reloc_pages()
+ {
+-    static const std::optional<int64_t> v = detail::int_(455, 0);
++    static const std::optional<int64_t> v = detail::int_(456, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_S2_ROWHASH
+ inline bool test_s2_rowhash()
+ {
+-    static const bool v = *detail::flag(456, 0);
++    static const bool v = *detail::flag(457, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_S2_RUNS
+ inline const std::optional<std::string>& test_s2_runs()
+ {
+-    static const std::optional<std::string> v = detail::text(457, 0);
++    static const std::optional<std::string> v = detail::text(458, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_S2_SHRINK_AT
+ inline std::optional<int64_t> test_s2_shrink_at()
+ {
+-    static const std::optional<int64_t> v = detail::int_(458, 0);
++    static const std::optional<int64_t> v = detail::int_(459, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_S2_SOLO1
+ inline bool test_s2_solo1()
+ {
+-    static const bool v = *detail::flag(459, 0);
++    static const bool v = *detail::flag(460, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_S2_XLIST
+ inline const std::optional<std::vector<int64_t>>& test_s2_xlist()
+ {
+-    static const std::optional<std::vector<int64_t>> v = detail::ints(460, 0);
++    static const std::optional<std::vector<int64_t>> v = detail::ints(461, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_TOKENIZER_DIR
+ inline const std::optional<std::string>& test_tokenizer_dir()
+ {
+-    static const std::optional<std::string> v = detail::text(461, 0);
++    static const std::optional<std::string> v = detail::text(462, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_VISION_CASES
+ inline const std::optional<std::string>& test_vision_cases()
+ {
+-    static const std::optional<std::string> v = detail::text(462, 0);
++    static const std::optional<std::string> v = detail::text(463, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_ZERO_DELAY_MS
+ inline int64_t test_zero_delay_ms()
+ {
+-    static const int64_t v = *detail::int_(463, 0);
++    static const int64_t v = *detail::int_(464, 0);
+     return v;
+ }
+ 
+ /// TMPDIR
+ inline const std::string& tmpdir()
+ {
+-    static const std::string v = *detail::text(464, 0);
++    static const std::string v = *detail::text(465, 0);
+     return v;
+ }
+ 
+ /// GR8_TR3_W2ALL
+ inline bool tr3_w2all()
+ {
+-    static const bool v = *detail::flag(465, 0);
++    static const bool v = *detail::flag(466, 0);
+     return v;
+ }
+ 
+ /// GR8_V2_SHARED
+ inline const std::optional<std::string>& v2_shared()
+ {
+-    static const std::optional<std::string> v = detail::text(466, 0);
++    static const std::optional<std::string> v = detail::text(467, 0);
+     return v;
+ }
+ 
+ /// GR8_WARM
+ inline int64_t warm()
+ {
+-    static const int64_t v = *detail::int_(467, 0);
++    static const int64_t v = *detail::int_(468, 0);
+     return v;
+ }
+ 
+ /// GR8_WEIGHT_CHECK
+ inline bool weight_check()
+ {
+-    static const bool v = *detail::flag(468, 0);
++    static const bool v = *detail::flag(469, 0);
+     return v;
+ }
+ 
+ /// GR8_WEIGHT_CHECK_FLIP
+ inline const std::optional<std::string>& weight_check_flip()
+ {
+-    static const std::optional<std::string> v = detail::text(469, 0);
++    static const std::optional<std::string> v = detail::text(470, 0);
+     return v;
+ }
+ 
+ /// GR8_WIDTHS
+ inline const std::optional<std::string>& widths()
+ {
+-    static const std::optional<std::string> v = detail::text(470, 0);
++    static const std::optional<std::string> v = detail::text(471, 0);
+     return v;
+ }
+ 
+ /// GR8_WORK_DIR
+ inline const std::optional<std::string>& work_dir()
+ {
+-    static const std::optional<std::string> v = detail::text(471, 0);
++    static const std::optional<std::string> v = detail::text(472, 0);
+     return v;
+ }
+ 
+ /// GR8_XGRAMMAR
+ inline const std::optional<std::string>& xgrammar()
+ {
+-    static const std::optional<std::string> v = detail::text(472, 0);
++    static const std::optional<std::string> v = detail::text(473, 0);
+     return v;
+ }
+ 
+ /// GR8_XGRAMMAR_LIB
+ inline const std::optional<std::string>& xgrammar_lib()
+ {
+-    static const std::optional<std::string> v = detail::text(473, 0);
++    static const std::optional<std::string> v = detail::text(474, 0);
+     return v;
+ }
+ 
+ /// GR8_XTRACE
+ inline bool xtrace()
+ {
+-    static const bool v = *detail::flag(474, 0);
++    static const bool v = *detail::flag(475, 0);
+     return v;
+ }
+ 
+ /// GR8_XTRACE_OUT
+ inline const std::optional<std::string>& xtrace_out()
+ {
+-    static const std::optional<std::string> v = detail::text(475, 0);
++    static const std::optional<std::string> v = detail::text(476, 0);
+     return v;
+ }
+ 
+ /// GR8_XTRACE_PF
+ inline bool xtrace_pf()
+ {
+-    static const bool v = *detail::flag(476, 0);
++    static const bool v = *detail::flag(477, 0);
+     return v;
+ }
+ 
+ /// GR8_XTRACE_QUIT
+ inline const std::optional<std::string>& xtrace_quit()
+ {
+-    static const std::optional<std::string> v = detail::text(477, 0);
++    static const std::optional<std::string> v = detail::text(478, 0);
+     return v;
+ }
+ 
+diff --git a/engine/module_info.h b/engine/module_info.h
+index 9f9163b..59a53ed 100644
+--- a/engine/module_info.h
++++ b/engine/module_info.h
+@@ -10,7 +10,7 @@
+ 
+ #define G6_MODULE_ABI 3
+ 
+-enum G6ModelId { G6_MODEL_ID_GLM53 = 1, G6_MODEL_ID_GLM53F = 2, G6_MODEL_ID_DS41 = 3 };
++enum G6ModelId { G6_MODEL_ID_GLM53 = 1, G6_MODEL_ID_GLM53F = 2, G6_MODEL_ID_DS41 = 3, G6_MODEL_ID_ML4 = 4 };
+ 
+ // model behaviours host code branches on (G6ModuleInfo::caps)
+ enum G6ModuleCap
+@@ -67,6 +67,8 @@ constexpr uint32_t this_model()
+     return G6_MODEL_ID_DS41;
+ #elif G6_MODEL_FLASH
+     return G6_MODEL_ID_GLM53F;
++#elif G6_MODEL_ML4
++    return G6_MODEL_ID_ML4;
+ #else
+     return G6_MODEL_ID_GLM53;
+ #endif
+@@ -77,7 +79,7 @@ constexpr G6ModuleInfo make()
+     G6ModuleInfo m{};
+     m.abi = G6_MODULE_ABI;
+     m.model = this_model();
+-    const char* name = m.model == G6_MODEL_ID_DS41 ? "ds41" : m.model == G6_MODEL_ID_GLM53F ? "glm-5.3-flash" : "glm-5.3";
++    const char* name = m.model == G6_MODEL_ID_DS41 ? "ds41" : m.model == G6_MODEL_ID_GLM53F ? "glm-5.3-flash" : m.model == G6_MODEL_ID_ML4 ? "ml4" : "glm-5.3";
+     for (int i = 0; name[i] && i < 15; ++i) m.name[i] = name[i];
+     m.nr = g6nr::NR;
+     m.mx = g6mx::MX;
+@@ -111,6 +113,7 @@ constexpr G6ModuleInfo make()
+     {
+     case G6_MODEL_ID_DS41: m.caps = G6_CAP_MTP0 | G6_CAP_PACK | G6_CAP_PARK | G6_CAP_PROMPT_DECODE | G6_CAP_DSPARK; break;
+     case G6_MODEL_ID_GLM53F: m.caps = G6_CAP_DFLASH2 | G6_CAP_FLASH_COST | G6_CAP_KDA | G6_CAP_GRAMMAR; break;
++    case G6_MODEL_ID_ML4: m.caps = G6_CAP_MTP0; break;   // no draft head until DSpark (Stage 3 M3)
+     default: m.caps = G6_CAP_DFLASH2 | G6_CAP_GRAMMAR; break;
+     }
+     return m;
+diff --git a/engine/runtime/engine_options.h b/engine/runtime/engine_options.h
+index ee1a1dc..0ec14f1 100644
+--- a/engine/runtime/engine_options.h
++++ b/engine/runtime/engine_options.h
+@@ -212,7 +212,7 @@ inline void fill(const g6opt_options& c, EngineOptions& o)
+ // Empty: the options pass; else the message main dies with.
+ inline std::string parse_engine_options(int argc, char** argv, EngineOptions& o)
+ {
+-#if !G6_MODEL_DS41
++#if !G6_MODEL_DS41 && !G6_MODEL_ML4   // ML4 routes its top-4 in glue::k_router_plan_ml4, not through GR8_MOE_TOPK
+     static_assert(geom::TOPK == 8, "GR8_MOE_TOPK's default and range (knobs/decode.yaml) are the model's top-k");
+ #endif
+     if (g6sch_layout() != g6sch_layout_cpp()) return "scheduler-rs: struct layouts differ from g6sched.h (rebuild libg6host.a)";
+diff --git a/engine/runtime/g6m4.cu b/engine/runtime/g6m4.cu
+index d94d5c0..0429ef6 100644
+--- a/engine/runtime/g6m4.cu
++++ b/engine/runtime/g6m4.cu
+@@ -140,6 +140,7 @@ bool ds41_c2_trace_on();
+ #include "rt_rows.cuh"
+ #include "s2/kv_share.h"
+ #include "host_reclaim.h"
++#include "teacher_dump.h"
+ #include <filesystem>
+ #include <fstream>
+ #include <iterator>
+@@ -353,11 +354,12 @@ int main(int argc, char** argv)
+     // both (main and draft steps never run at once; inside the shim / front end's taskset range 0..N-8;
+     // GR8_QA_SPLIT_CPU moves it). Every rank must run the same values (the S2 runtime signature carries them).
+     // replicated-GEMV split needs peers to gather across (pointless at TP1); the Flash build plans no gathers
+-    // DS41 builds no QSplit geometry, so the split is off there and a request for it is refused
+-    const bool qs_def = g6nr::NR > 1 && !G6_MODEL_FLASH && !G6_MODEL_DS41;
++    // DS41 builds no QSplit geometry, so the split is off there and a request for it is refused; so does ML4 (no q_a; its
++    // replicated kv_a / indexer GEMVs are not split yet)
++    const bool qs_def = g6nr::NR > 1 && !G6_MODEL_FLASH && !G6_MODEL_DS41 && !G6_MODEL_ML4;
+     const int qs_mode = (int)knob::qa_split().value_or(qs_def ? 2 : 0);
+     const bool iq_split = knob::idxq_split().value_or(qs_def), mtp_split = knob::mtp_split().value_or(qs_def && mtp);
+-    if ((G6_MODEL_FLASH || G6_MODEL_DS41) && (qs_mode || iq_split || mtp_split)) die("GR8_QA_SPLIT, GR8_IDXQ_SPLIT and GR8_MTP_SPLIT are GLM-5.3 paths");
++    if ((G6_MODEL_FLASH || G6_MODEL_DS41 || G6_MODEL_ML4) && (qs_mode || iq_split || mtp_split)) die("GR8_QA_SPLIT, GR8_IDXQ_SPLIT and GR8_MTP_SPLIT are GLM-5.3 paths");
+     if (mtp_split && !mtp) die("GR8_MTP_SPLIT=1 needs --mtp");
+     // GR8_S2_DSEL_MODEL=1 + GR8_S2_DSEL_TABLE=<key:value list | file> (s2_batch.h DSelTable; default 0): the drafter
+     // choice prices both drafters from one frozen cost table and MTP rounds under the confidence stop. Every rank reads
+@@ -1047,6 +1049,22 @@ int main(int argc, char** argv)
+         const int32_t hdr[] = {g6nr::NR, R, geom::VOCAB, m.vlo, m.vn};
+         dump_write(ldump, hdr, sizeof hdr);
+     }
++    TeacherDump tdump;                  // GR8_TEACHER_DUMP (teacher_dump.h): offline, every --prompt one sequence of one length
++    std::vector<float> tdump_lg;
++    if (const auto& dir = knob::teacher_dump()) {
++        if (s2mode) die("GR8_TEACHER_DUMP is for offline runs (no --serve)");
++        for (const Plan& p : plans)
++            if (p.prompt.size() != plans[0].prompt.size()) die("GR8_TEACHER_DUMP: every --prompt must have the same length");
++        const std::string e = tdump.open(*dir, R, (int)plans.size(), (int)plans[0].prompt.size(), m.vlo, m.vn);
++        if (!e.empty()) die("GR8_TEACHER_DUMP: " + e);
++        tdump_lg.resize((size_t)MX * m.vn);
++        if (R == 0) fprintf(stderr, "# teacher dump: %d sequences x %d rows, K %d -> %s/r<rank>.tf\n", tdump.Nq, tdump.S, tdump.K, dir->c_str());
++    }
++    auto teacher_rows = [&](int q, const int* pos, int M, const std::vector<int>& prompt) {
++        if (!tdump.on()) return;
++        G6RT_CK(cudaMemcpy(tdump_lg.data(), m.hlog, (size_t)M * m.vn * sizeof(float), cudaMemcpyDeviceToHost));
++        tdump.rows(q, pos, M, tdump_lg.data(), prompt);
++    };
+ #if G6_MODEL_FLASH
+     // MTP first draft passes only, as m4sim: rank 0 writes GR8_DRAFT_IN_DUMP; every
+     // rank writes its vocab slice to GR8_DRAFT_LOGIT_DUMP.rank<R> in the GR8_LOGIT_DUMP rank format (the step field is
+@@ -3410,6 +3428,7 @@ int main(int argc, char** argv)
+ #else
+             main_dump(s, M);
+ #endif
++            teacher_rows((int)q, si.pos, M, p.prompt);
+             if (reuse_prefix) reuse.main_rows(si.pos[0], M);
+             if (rlf) route_log_line(rlf, m, layers, q, s, M, si.pos[0], p.prompt.size());
+             std::string line;
+@@ -3522,6 +3541,7 @@ int main(int argc, char** argv)
+             std::string line;
+             if (reuse_prefix) reuse.main_rows(in->pos[0], M);
+             main_dump(s, M);
++            teacher_rows((int)q, in->pos, M, p.prompt);
+             if (rlf) route_log_line(rlf, m, layers, q, s, M, in->pos[0], p.prompt.size());
+             last_tok = step_line(m, so, s, M, line);
+             printf("%s\n", line.c_str());
+@@ -3629,6 +3649,7 @@ int main(int argc, char** argv)
+ #endif
+     if (rdf && fclose(rdf)) die("GR8_RESID_DUMP: close failed");
+     if (ldump && fclose(ldump)) die("GR8_LOGIT_DUMP: close failed");
++    tdump.close();
+ #if G6_MODEL_FLASH
+     if (didump && fclose(didump)) die("GR8_DRAFT_IN_DUMP: close failed");
+     if (dldump && fclose(dldump)) die("GR8_DRAFT_LOGIT_DUMP: close failed");
+diff --git a/engine/runtime/teacher_dump.h b/engine/runtime/teacher_dump.h
+new file mode 100644
+index 0000000..af7264d
+--- /dev/null
++++ b/engine/runtime/teacher_dump.h
+@@ -0,0 +1,73 @@
++#pragma once
++// GR8_TEACHER_DUMP=DIR (offline g6m4): a compact teacher-forced scoring dump against a reference's candidate ids.
++// Every --prompt is one sequence of S tokens (all the same length); DIR/ids.i32 holds int32 [Nq][S][K] token ids (the
++// reference's top K per row), K = its size / (Nq * S * 4). Each rank writes DIR/r<rank>.tf, float32 [Nq][S][4 + K] at
++// row (q, pos): this rank's vocab slice log-sum-exp (computed in double), its slice maximum, its argmax token id (as a
++// float, exact below 2^24), the logit of the next prompt token (-inf outside the slice or on the last row), then the
++// logits of the K ids (-inf outside the slice). Logits are the head's final ones (ML4: after the softcap). The
++// log-softmax over the whole vocabulary is the ranks' log-sum-exps combined (tools/q5_teacher_merge.py in the recipe).
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <string>
++#include <vector>
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++struct TeacherDump
++{
++    int ids_fd = -1, out_fd = -1, Nq = 0, S = 0, K = 0, vlo = 0, vn = 0;
++    std::vector<int32_t> ids;
++    std::vector<float> rec, lg;
++    bool on() const { return out_fd >= 0; }
++    // "" on success, else the message
++    std::string open(const std::string& dir, int rank, int nq, int s, int vlo_, int vn_)
++    {
++        const std::string in = dir + "/ids.i32", out = dir + "/r" + std::to_string(rank) + ".tf";
++        ids_fd = ::open(in.c_str(), O_RDONLY);
++        if (ids_fd < 0) return "cannot open " + in;
++        struct stat sb;
++        if (fstat(ids_fd, &sb) || nq <= 0 || s <= 0 || sb.st_size % ((off_t)nq * s * 4))
++            return in + ": size is not a multiple of prompts x prompt length x 4";
++        Nq = nq; S = s; K = (int)(sb.st_size / ((off_t)nq * s * 4)); vlo = vlo_; vn = vn_;
++        out_fd = ::open(out.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
++        if (out_fd < 0) return "cannot open " + out;
++        ids.resize(K); rec.resize(4 + (size_t)K);
++        return "";
++    }
++    // rows j of a step: sequence q, positions pos[j], logits [M][vn] of this rank's slice (device copy done by the caller)
++    void rows(int q, const int* pos, int M, const float* logits, const std::vector<int>& prompt)
++    {
++        for (int j = 0; j < M; ++j)
++        {
++            const int p = pos[j];
++            if (p < 0 || p >= S) continue;
++            const float* x = logits + (size_t)j * vn;
++            int am = 0;
++            for (int v = 1; v < vn; ++v) if (x[v] > x[am]) am = v;
++            double se = 0.0;
++            for (int v = 0; v < vn; ++v) se += std::exp((double)x[v] - (double)x[am]);
++            rec[0] = (float)((double)x[am] + std::log(se));
++            rec[1] = x[am];
++            rec[2] = (float)(vlo + am);
++            const int nx = p + 1 < S ? prompt[p + 1] - vlo : -1;
++            rec[3] = nx >= 0 && nx < vn ? x[nx] : -INFINITY;
++            const off_t row = (off_t)q * S + p;
++            if (pread(ids_fd, ids.data(), (size_t)K * 4, row * K * 4) != (ssize_t)K * 4) { fprintf(stderr, "GR8_TEACHER_DUMP: ids read failed\n"); _exit(3); }
++            for (int k = 0; k < K; ++k)
++            {
++                const int v = ids[k] - vlo;
++                rec[4 + k] = v >= 0 && v < vn ? x[v] : -INFINITY;
++            }
++            const size_t nb = rec.size() * 4;
++            if (pwrite(out_fd, rec.data(), nb, row * (off_t)nb) != (ssize_t)nb) { fprintf(stderr, "GR8_TEACHER_DUMP: write failed\n"); _exit(3); }
++        }
++    }
++    void close()
++    {
++        if (ids_fd >= 0) ::close(ids_fd);
++        if (out_fd >= 0) { fsync(out_fd); ::close(out_fd); }
++        ids_fd = out_fd = -1;
++    }
++};
+diff --git a/engine/scheduler-rs/src/module_info.rs b/engine/scheduler-rs/src/module_info.rs
+index f388510..497d8b3 100644
+--- a/engine/scheduler-rs/src/module_info.rs
++++ b/engine/scheduler-rs/src/module_info.rs
+@@ -7,6 +7,7 @@ pub const MODULE_ABI: u32 = 3;
+ pub const MODEL_GLM53: u32 = 1;
+ pub const MODEL_GLM53F: u32 = 2;
+ pub const MODEL_DS41: u32 = 3;
++pub const MODEL_ML4: u32 = 4;
+ 
+ #[repr(C)]
+ #[derive(Clone, Copy, Debug)]
+diff --git a/engine/scheduler-rs/src/options.rs b/engine/scheduler-rs/src/options.rs
+index 08d847f..21e6ab0 100644
+--- a/engine/scheduler-rs/src/options.rs
++++ b/engine/scheduler-rs/src/options.rs
+@@ -14,7 +14,7 @@ use std::io::Write;
+ use crate::cstd::{c_atof, c_atoi, c_strtol10, c_strtoul10, c_strtoull10, cs, read_ints};
+ use crate::ffi::Ints;
+ use crate::knob_ids as kid;
+-use crate::module_info::{ModuleInfo, MODEL_DS41, MODEL_GLM53F, MODULE_ABI};
++use crate::module_info::{ModuleInfo, MODEL_DS41, MODEL_GLM53F, MODEL_ML4, MODULE_ABI};
+ use crate::spec_len::SpecLen;
+ 
+ pub type FlagFn = unsafe extern "C" fn(u32, u32, *mut c_int) -> c_int;
+@@ -722,7 +722,7 @@ fn alt_hex(v: u32) -> String {
+ /// The parse. Err is the message main dies with.
+ pub fn parse(m: &ModuleInfo, api: &KnobApi, host: &Host, argv: &[Str]) -> Result<Opts, Str> {
+     let k = Knobs(api);
+-    let (ds41, flash) = (m.model == MODEL_DS41, m.model == MODEL_GLM53F);
++    let (ds41, flash, ml4) = (m.model == MODEL_DS41, m.model == MODEL_GLM53F, m.model == MODEL_ML4);
+     let (nr, mx, s2n) = (m.nr, m.mx, m.s2n);
+     let dfl_drafts = m.dfl_drafts;
+     let mut o = Opts {
+@@ -765,6 +765,13 @@ pub fn parse(m: &ModuleInfo, api: &KnobApi, host: &Host, argv: &[Str]) -> Result
+         if k.flag(kid::PF_ROUTER_SPLIT) {
+             return Err("GR8_PF_ROUTER_SPLIT is a Flash-model option".into());
+         }
++    } else if ml4 {
++        if k.int(kid::MOE_TOPK) != 8 {
++            return Err("GR8_MOE_TOPK is a Flash-model option (ML4 routes its top-4 in glue::k_router_plan_ml4)".into());
++        }
++        if k.flag(kid::PF_ROUTER_SPLIT) {
++            return Err("GR8_PF_ROUTER_SPLIT is a Flash-model option".into());
++        }
+     } else {
+         if k.int(kid::MOE_TOPK) != m.topk as i64 {
+             return Err("GR8_MOE_TOPK is a Flash-model option (this build is the GLM model)".into());
+diff --git a/knobs/serving.yaml b/knobs/serving.yaml
+index 4ef68c8..a2f85a3 100644
+--- a/knobs/serving.yaml
++++ b/knobs/serving.yaml
+@@ -121,6 +121,15 @@ knobs:
+     doc: >-
+       Offline runs write each main step's head logits (each rank's vocab slice) to PATH.rank<R>, with a header. Not with
+       --serve.
++  GR8_TEACHER_DUMP:
++    scope: local
++    kind: path
++    unset: "unset"
++    doc: >-
++      Offline runs, every --prompt one sequence of the same length S: reads DIR/ids.i32 (int32 [prompts][S][K], the
++      reference's candidate ids per row) and writes DIR/r<rank>.tf, float32 [prompts][S][4 + K]: the rank's vocab slice
++      log-sum-exp, maximum, argmax id, the next prompt token's logit, and the logits of the K ids (-inf outside the
++      slice). Teacher-forced scoring against a reference (runtime/teacher_dump.h). Not with --serve.
+   GR8_LOGIT_DUMP_FROM:
+     scope: local
+     kind: int
+-- 
+2.43.0
+

@@ -1,0 +1,57 @@
+From 02d5408077f5b72bf349879a9044801a07ef4c17 Mon Sep 17 00:00:00 2001
+From: grubbychicken <ben@grbychkn.com>
+Date: Tue, 10 Nov 2026 16:31:33 +0000
+Subject: [PATCH] ML4_PF_EXPROF: the routed segments of a MoE pass (count,
+ fill, experts, the shared expert share)
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ engine/runtime/prefill.cuh | 25 ++++++++++++++++++++++---
+ 1 file changed, 22 insertions(+), 3 deletions(-)
+
+diff --git a/engine/runtime/prefill.cuh b/engine/runtime/prefill.cuh
+index 0cf76b2..56d99e7 100644
+--- a/engine/runtime/prefill.cuh
++++ b/engine/runtime/prefill.cuh
+@@ -1404,9 +1404,13 @@ inline void pf_mlp_block_ml4(Model& m, Prefill& P, int i, int M, cudaStream_t st
+         static const bool exprof = getenv("ML4_PF_EXPROF") != nullptr;
+         if (exprof)
+         {
+-            struct Ex { double t[6] = {}; long n = 0, rows = 0; int rank = -1;
+-                        ~Ex() { if (n && rank == 0) fprintf(stderr, "# pf exprof: %ld MoE passes, %ld rows: router %.1f, route %.1f, fc1 %.1f, mid %.1f, fc2 %.1f, fin %.1f ms\n",
+-                                                           n, rows, t[0], t[1], t[2], t[3], t[4], t[5]); } };
++            // and the routed segments (k_pf_fill: up to RS = 64 routes of one expert each): how many, how full, how many
++            // experts had rows, the shared expert's share
++            struct Ex { double t[6] = {}; long n = 0, rows = 0, segs = 0, routes = 0, h[4] = {}, exps = 0, shsegs = 0; int rank = -1;
++                        ~Ex() { if (n && rank == 0) fprintf(stderr, "# pf exprof: %ld MoE passes, %ld rows: router %.1f, route %.1f, fc1 %.1f, mid %.1f, fc2 %.1f, fin %.1f ms; "
++                                                           "a pass: %.1f segments (%.1f of the shared expert) for %.1f experts, %.1f routes a segment, segments of <=16 / <=32 / <=48 / <=64 routes %.0f / %.0f / %.0f / %.0f%%\n",
++                                                           n, rows, t[0], t[1], t[2], t[3], t[4], t[5], (double)segs / n, (double)shsegs / n, (double)exps / n,
++                                                           (double)routes / (segs ? segs : 1), 100. * h[0] / segs, 100. * h[1] / segs, 100. * h[2] / segs, 100. * h[3] / segs); } };
+             static Ex X;
+             X.rank = m.rank; ++X.n; X.rows += M;
+             auto lap = [&](int k, double& t0) { G6RT_CK(cudaStreamSynchronize(st)); const double t1 = PfProf::now(); X.t[k] += t1 - t0; t0 = t1; };
+@@ -1415,6 +1419,21 @@ inline void pf_mlp_block_ml4(Model& m, Prefill& P, int i, int M, cudaStream_t st
+             bindp::launch_ck(b.router, st); lap(0, t0);
+             pf_mark(5, st);
+             bindp::launch_route(b.ex, st); lap(1, t0);
++            {
++                int ns = 0;
++                G6RT_CK(cudaMemcpy(&ns, b.ex.n_seg, sizeof ns, cudaMemcpyDeviceToHost));
++                std::vector<int> sg((size_t)ns * 3);
++                if (ns) G6RT_CK(cudaMemcpy(sg.data(), b.ex.segs, sg.size() * sizeof(int), cudaMemcpyDeviceToHost));
++                int last = -1;
++                for (int q = 0; q < ns; ++q)
++                {
++                    const int e = sg[3 * q], r = sg[3 * q + 2];
++                    ++X.segs; X.routes += r; ++X.h[std::min(3, std::max(0, (r - 1) / 16))];
++                    if (e != last) { ++X.exps; last = e; }
++                    if (e == bindp::NEXP) ++X.shsegs;
++                }
++                t0 = PfProf::now();
++            }
+             bindp::launch_fc1(b.ex, st); lap(2, t0);
+             bindp::launch_mid(b.ex, st); lap(3, t0);
+             bindp::launch_fc2(b.ex, st); lap(4, t0);
+-- 
+2.43.0
+

@@ -1,0 +1,75 @@
+From 628e4df01a95823888e65b52c4deaf3b434310cf Mon Sep 17 00:00:00 2001
+From: grubbychicken <ben@grbychkn.com>
+Date: Tue, 10 Nov 2026 15:19:18 +0000
+Subject: [PATCH] ML4: verify costs with --wide for --spec-adaptive;
+ ML4_PF_EXPROF=1 (diagnostic): the prefill MoE pass by stage (router, route,
+ fc1, mid, fc2, fin), synchronized
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ engine/runtime/prefill.cuh | 24 ++++++++++++++++++++++++
+ engine/runtime/spec_len.h  |  8 ++++----
+ 2 files changed, 28 insertions(+), 4 deletions(-)
+
+diff --git a/engine/runtime/prefill.cuh b/engine/runtime/prefill.cuh
+index 7ad3e4f..0cf76b2 100644
+--- a/engine/runtime/prefill.cuh
++++ b/engine/runtime/prefill.cuh
+@@ -1399,9 +1399,33 @@ inline void pf_mlp_block_ml4(Model& m, Prefill& P, int i, int M, cudaStream_t st
+     pf_mark(7, st);
+     if (b.moe)
+     {
++        // ML4_PF_EXPROF=1 (diagnostic; not a knob): the MoE pass's own stages, each synchronized, summed over the run
++        // and printed by rank 0 at exit (ms): router GEMM, route + count + fill, fc1, mid, fc2, fin
++        static const bool exprof = getenv("ML4_PF_EXPROF") != nullptr;
++        if (exprof)
++        {
++            struct Ex { double t[6] = {}; long n = 0, rows = 0; int rank = -1;
++                        ~Ex() { if (n && rank == 0) fprintf(stderr, "# pf exprof: %ld MoE passes, %ld rows: router %.1f, route %.1f, fc1 %.1f, mid %.1f, fc2 %.1f, fin %.1f ms\n",
++                                                           n, rows, t[0], t[1], t[2], t[3], t[4], t[5]); } };
++            static Ex X;
++            X.rank = m.rank; ++X.n; X.rows += M;
++            auto lap = [&](int k, double& t0) { G6RT_CK(cudaStreamSynchronize(st)); const double t1 = PfProf::now(); X.t[k] += t1 - t0; t0 = t1; };
++            G6RT_CK(cudaStreamSynchronize(st));
++            double t0 = PfProf::now();
++            bindp::launch_ck(b.router, st); lap(0, t0);
++            pf_mark(5, st);
++            bindp::launch_route(b.ex, st); lap(1, t0);
++            bindp::launch_fc1(b.ex, st); lap(2, t0);
++            bindp::launch_mid(b.ex, st); lap(3, t0);
++            bindp::launch_fc2(b.ex, st); lap(4, t0);
++            bindp::launch_fin(b.ex, st); lap(5, t0);
++        }
++        else
++        {
+         bindp::launch_ck(b.router, st);       // x2 -> fp32 logits [M][128]
+         pf_mark(5, st);
+         bindp::launch_experts(b.ex, st);      // k_pf_route_ml4, then the routed + shared (Expert::shr) fp16 passes
++        }
+     }
+     else
+     {
+diff --git a/engine/runtime/spec_len.h b/engine/runtime/spec_len.h
+index c58a9c1..56ac619 100644
+--- a/engine/runtime/spec_len.h
++++ b/engine/runtime/spec_len.h
+@@ -118,12 +118,12 @@ struct SpecLen
+ #if G6_MODEL_ML4
+     // Mistral Large 4 on four Sparks (TP4 ring, EXL3 3 bpw, DSpark head of 3 drafts): verify ms by rows 1..4 = the p50
+     // of offline graph steps at a short context (the recipe's tools/s4_dec.sh with S4_K 1 / 2 / 3 and plain, 2026-11-10:
+-    // each row past the first reads its own experts, 13-16 ms), rows 5..8 extrapolated at the last step (the head drafts
+-    // three); the DSpark proposal 8.7 ms a round whatever the count. At 28K context the four are 58.4 / 81.0 / 98.2 /
+-    // 115.7: about 1.25x each, which moves no decision much. Seeds: the head's rates on code and prose (NOTES D0).
++    // with --wide: each row past the first reads its own experts, 12-14 ms), rows 5..8 extrapolated at the last step (the
++    // head drafts three); the DSpark proposal 8.7 ms a round whatever the count. At 28K context a 4-row step is 109.7:
++    // about 1.3x, which moves no decision much. Seeds: the head's rates on code and prose (NOTES D0).
+     void ml4_cost()
+     {
+-        static const double t[KX + 2] = {0, 47.1, 63.3, 77.3, 90.6, 104.0, 117.4, 130.8, 144.2};
++        static const double t[KX + 2] = {0, 44.7, 59.1, 71.2, 83.1, 95.1, 107.1, 119.1, 131.1};
+         static const double s[KX + 1] = {0, 0.80, 0.78, 0.75, 0.75, 0.75, 0.75, 0.75};
+         std::copy(t, t + KX + 2, table);
+         std::copy(s, s + KX + 1, seed);
+-- 
+2.43.0
+

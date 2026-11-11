@@ -1,0 +1,191 @@
+From 91aaa46fd765823ed416beeccf7b94d80d794497 Mon Sep 17 00:00:00 2001
+From: grubbychicken <ben@grbychkn.com>
+Date: Tue, 10 Nov 2026 12:35:57 +0000
+Subject: [PATCH] ML4 decode attention: head-batched scores and context over
+ the FP16 latent row (ml4-decode.cuh: a key is loaded once for 16 / 4 heads,
+ not once per head; same bits as the generic kernels, GR8_ATTN_HEADS=0 =
+ those); GR8_DEC_PROF stages inside the CP block. 4-row verify 98.6 -> 91.0 ms
+ short, 169.5 -> 118.1 ms at 28K
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ engine/attn/attn.cu          |  5 ++-
+ engine/attn/decode-small.cuh | 15 ++++++---
+ engine/attn/ml4-decode.cuh   | 62 ++++++++++++++++++++++++++++++++++++
+ engine/runtime/rank.cuh      |  8 +++++
+ 4 files changed, 85 insertions(+), 5 deletions(-)
+ create mode 100644 engine/attn/ml4-decode.cuh
+
+diff --git a/engine/attn/attn.cu b/engine/attn/attn.cu
+index a0134a5..4c7a955 100644
+--- a/engine/attn/attn.cu
++++ b/engine/attn/attn.cu
+@@ -748,6 +748,7 @@ static Work workspace(const G6Attn& a,void* base){
+     if(e!=cudaSuccess)return Work{};b=std::max(b,single);w.temp_bytes=b;w.temp=alloc(b);w.total=n;return w;
+ }
+ #include "kv4.cuh"
++#include "ml4-decode.cuh"
+ #include "decode-small.cuh"
+ #include "rt.cuh"
+ template<class Input>
+@@ -891,7 +892,9 @@ static void launch_value_project_m1(const G6Attn& a,Input input,Work& w,int star
+ // launch_mla_scores' scores_sc branch with S = 2 / 4 (no FLIP, no P11), absorb_m2 (DEC_AVP without GR8_AVP1), q_b, the
+ // scratch q / rope and the KV rows 16 B aligned. The CP paths never pass qt.
+ static bool use_qt(const G6Attn& a,const Work& w,int n){
+-#if defined(DEC_AVP) && DEC_AVP
++#if G6_MODEL_ML4   // the ML4 scores kernels read q / rope as absorb stores them
++    (void)a;(void)w;(void)n;return false;
++#elif defined(DEC_AVP) && DEC_AVP
+     return attn_qt()&&!avp1_on()&&!use_attn_flip(a,n)&&attn_heads()&&!attn_p11()&&(attn_sc2()==2||attn_sc2()==4)&&sc2_heads_ok(a)&&
+         al16(a.q_b)&&al16(w.q)&&al16(w.rope)&&al16(a.mla_cache);
+ #else
+diff --git a/engine/attn/decode-small.cuh b/engine/attn/decode-small.cuh
+index 175f5a7..bb30fe4 100644
+--- a/engine/attn/decode-small.cuh
++++ b/engine/attn/decode-small.cuh
+@@ -631,8 +631,10 @@ static void launch_context_tile(const G6Attn& a,Input input,Work& w,int start,in
+ // index and contexts past 2048 included.
+ template<class Input>   // qt: run_body only (attn.cu use_qt, which implies the scores_sc branch below)
+ static void launch_mla_scores(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st,bool qt=false){
+- #if G6_MODEL_ML4   // the FP16 ML4 row (kvfmt.h): the generic kernel (latent() / rope_key()); the FP8 variants below read E4M3
+- (void)qt;mla_scores<<<dim3(TOP/8,a.heads,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);
++ #if G6_MODEL_ML4   // the FP16 ML4 row (kvfmt.h): its head-batched kernel (ml4-decode.cuh), or the generic one; the FP8 variants below read E4M3
++ (void)qt;
++ if(attn_heads()){constexpr int HG=16;ml4dec::scores_heads<HG><<<dim3(TOP/8,(a.heads+HG-1)/HG,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);}
++ else mla_scores<<<dim3(TOP/8,a.heads,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);
+  return;
+  #endif
+  #if G6_KV4   // the INT4 row has the head-batched kernel and the generic one; the FP8-only variants below are not used
+@@ -651,8 +653,13 @@ static void launch_mla_scores(const G6Attn& a,Input input,Work& w,int start,int
+ // sp (run_body, ctx_sp): context_pk3's slots per partition; 256 = PART partitions (every other caller)
+ template<class Input>
+ static void launch_context_parts(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st,int sp=256){
+- #if G6_MODEL_ML4   // the FP16 ML4 row: the generic kernel (latent())
+- (void)sp;context_parts<<<dim3(PART,a.heads,n),256,0,st>>>(input,start,w.prob,w.parts);
++ #if G6_MODEL_ML4   // the FP16 ML4 row: its head-batched kernel (ml4-decode.cuh; head group as the FP8 path: 4 up to 4 rows, then 8; GR8_ATTN_CTX3_HG forces 2 / 4 / 8), or the generic one
++ (void)sp;
++ if(!attn_heads())context_parts<<<dim3(PART,a.heads,n),256,0,st>>>(input,start,w.prob,w.parts);
++ else switch(attn_ctx3_hg()?attn_ctx3_hg():n>=5?8:4){
++  case 2:ml4dec::context_parts_heads<2,16><<<dim3(PART*2,(a.heads+1)/2,n),128,0,st>>>(input,start,w.prob,w.parts);break;
++  case 8:ml4dec::context_parts_heads<8,16><<<dim3(PART*2,(a.heads+7)/8,n),128,0,st>>>(input,start,w.prob,w.parts);break;
++  default:ml4dec::context_parts_heads<4,16><<<dim3(PART*2,(a.heads+3)/4,n),128,0,st>>>(input,start,w.prob,w.parts);break;}
+  return;
+  #endif
+  #if G6_KV4
+diff --git a/engine/attn/ml4-decode.cuh b/engine/attn/ml4-decode.cuh
+new file mode 100644
+index 0000000..6732837
+--- /dev/null
++++ b/engine/attn/ml4-decode.cuh
+@@ -0,0 +1,62 @@
++// Mistral Large 4 decode kernels: the head-batched scores and context of decode-small.cuh over the FP16 ML4 latent row
++// (kvfmt.h f16ml4: [512 FP16 latent][64 FP16 rope], no scales). Included inside namespace ga, before decode-small.cuh;
++// only G6_MODEL_ML4 builds dispatch them (launch_mla_scores / launch_context_parts, GR8_ATTN_HEADS=0 = the generic
++// per-head mla_scores / context_parts). One key's bytes are loaded once for HG heads instead of once per head. Every
++// (row, head, slot) output keeps the generic kernels' arithmetic: the same products, the same fmaf order (dims
++// lane, lane + 32, ..; slots ascending within a partition), the same warp_sum, the same skip of dead slots and of
++// p == 0, so the outputs are bit-identical.
++#if G6_MODEL_ML4
++namespace ml4dec {
++using ga::half;
++// warp per (slot, row), heads [y*HG, y*HG + HG): lane l reads latent dims l + 32k and the rope elements l, l + 32;
++// lane hh stores head y*HG + hh
++template<int HG,class Input>
++__global__ void __launch_bounds__(256) scores_heads(Input input,int start,const float* q,const float* rope,float* out){
++ auto a=ga::resolve(input);if(!a.active)return;constexpr int WARPS=8;int row=blockIdx.z,r=start+row,h0=blockIdx.y*HG,j=blockIdx.x*WARPS+threadIdx.x/32,lane=threadIdx.x&31;FOR_ROW(a,input,r);
++ const int nh=min(HG,a.heads-h0);
++ int id=a.indices[(int64_t)r*ga::TOP+j];const uint8_t* v=(id>=0&&id<=a.positions[r]&&CP_MINE(a,id))?ga::kv_at(a,id):nullptr;
++ float mine=-INFINITY;
++ if(v){float kv[16],rv[2];
++  #pragma unroll
++  for(int k=0;k<16;k++)kv[k]=ga::latent(v,lane+k*32);
++  #pragma unroll
++  for(int k=0;k<2;k++)rv[k]=ga::rope_key(v,lane+k*32);
++  for(int hh=0;hh<nh;hh++){const int h=h0+hh;float sum=0;
++   #pragma unroll
++   for(int k=0;k<16;k++)sum=fmaf(__ldg(q+((int64_t)row*a.heads+h)*512+lane+k*32),kv[k],sum);
++   #pragma unroll
++   for(int k=0;k<2;k++)sum=fmaf(__ldg(rope+((int64_t)row*a.heads+h)*64+lane+k*32),rv[k],sum);
++   sum=ga::warp_sum(sum);if(lane==hh)mine=sum*(1.f/16);}}
++ if(lane<nh)out[((int64_t)row*a.heads+h0+lane)*ga::TOP+j]=mine;
++}
++// block per (part, half of the 512 dims, head group, row); thread t owns dims d, d + 1 (one 4-byte load) for HG heads.
++// PB gathered pairs are loaded per batch, before their FMAs
++template<int HG,int PB,class Input>
++__global__ void __launch_bounds__(128) context_parts_heads(Input input,int start,const float* probs,float* parts){
++ auto a=ga::resolve(input);if(!a.active)return;constexpr int D=256,THREADS=D/2;
++ int row=blockIdx.z,r=start+row,h0=blockIdx.y*HG,part=blockIdx.x/(512/D),d0=(blockIdx.x%(512/D))*D,t=threadIdx.x;FOR_ROW(a,input,r);
++ const int nh=min(HG,a.heads-h0);
++ __shared__ uintptr_t rows[256];__shared__ float probability[HG][256];bool active=false;
++ for(int j=t;j<256;j+=THREADS){int slot=part*256+j,id=a.indices[(int64_t)r*ga::TOP+slot];const uint8_t* src=nullptr;
++  const bool idok=id>=0&&id<=a.positions[r];   // dead slots read no probabilities
++  bool live=false;for(int hh=0;hh<HG;hh++){float p=idok&&hh<nh?probs[((int64_t)row*a.heads+h0+hh)*ga::TOP+slot]:0.f;probability[hh][j]=p;live|=p!=0;}
++  if(live)src=ga::kv_at(a,id);
++  rows[j]=(uintptr_t)src;active|=src!=nullptr;}
++ const bool any=__syncthreads_or(active);float lo[HG],hi[HG];
++ #pragma unroll
++ for(int hh=0;hh<HG;hh++){lo[hh]=0;hi[hh]=0;}
++ const int d=d0+2*t;
++ if(any)for(int j0=0;j0<256;j0+=PB){uint32_t raw[PB];
++  #pragma unroll
++  for(int u=0;u<PB;u++){const uint8_t* src=(const uint8_t*)rows[j0+u];raw[u]=src?*reinterpret_cast<const uint32_t*>(src+2*d):0u;}
++  #pragma unroll
++  for(int u=0;u<PB;u++){const int j=j0+u;if(!rows[j])continue;
++   __half_raw r0,r1;r0.x=(unsigned short)(raw[u]&0xffffu);r1.x=(unsigned short)(raw[u]>>16);
++   const float x0=__half2float(half(r0)),x1=__half2float(half(r1));
++   #pragma unroll
++   for(int hh=0;hh<HG;hh++){float p=probability[hh][j];if(p==0)continue;lo[hh]=fmaf(p,x0,lo[hh]);hi[hh]=fmaf(p,x1,hi[hh]);}}}
++ #pragma unroll
++ for(int hh=0;hh<HG;hh++)if(hh<nh){float* dst=parts+(((int64_t)row*a.heads+h0+hh)*ga::PART+part)*512;dst[d]=lo[hh];dst[d+1]=hi[hh];}
++}
++}
++#endif
+diff --git a/engine/runtime/rank.cuh b/engine/runtime/rank.cuh
+index ce27257..d80b087 100644
+--- a/engine/runtime/rank.cuh
++++ b/engine/runtime/rank.cuh
+@@ -1582,8 +1582,10 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
+         G6RT_CK(g6_attn_cp_front(a, cell, scr, sb, st));
+         G6RT_CK(g6_attn_cp_qabs(a, scr, &q, &rope));
+         cpglue::k_vput<<<G, 256, 0, st>>>(q, qn, rope, rn, C.vs[cq], m.stepp, C.tickets + cq);
++        dmark(DP_A_ABSORB, st);               // CP: front + absorbed q + its publish
+         G6RT_CK(g6_attn_cp_index(a, cell, scr, sb, C.cand, st));
+         if (cc >= 0) cpglue::k_vput<<<G, 256, 0, st>>>(C.cand + (size_t)r * M * 2048, cb, nullptr, 0, C.vs[cc], m.stepp, C.tickets + cc);
++        dmark(DP_A_INDEX, st);                // CP: this rank's index scores + candidates out
+         if (C.s3 && cc < 0) G6RT_CK(g6_attn_cp_group(a, cell, scr, sb, q, rope, part_of(r), st));
+     }
+     if (phase == 0) return;
+@@ -1598,9 +1600,12 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
+                 cpglue::k_vget<<<G, 256, 0, st>>>(v, j, m.stepp, C.cand + (size_t)v.src[j] * M * 2048, cb);
+             G6RT_CK(g6_attn_cp_merge_index(a, cell, C.cand, st));
+         }
++        dmark(DP_A_SELECT, st);               // CP: the candidates' wait, gets and merge
+         if (!C.s3 || cc >= 0) G6RT_CK(g6_attn_cp_group(a, cell, scr, sb, q, rope, part_of(r), st));
++        dmark(DP_A_SCORES, st);               // CP: this rank's own head group over its keys
+         const g6::VSlotDev& vq = C.vs[cq];
+         cpglue::k_vwait<<<1, 32, 0, st>>>(vq, m.stepp, qw, -1, cpglue::ERR_CP);
++        dmark(DP_A_NORMALIZE, st);            // CP: the wait for the peers' q
+         if (C.one)
+         {
+             // GR8_CP_ONECHAIN: remote group k (rank (r + k) % nr) = heads (k - 1) H .. kH - 1 of one call; its partial goes
+@@ -1638,6 +1643,7 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
+                                                    nullptr, 0, C.vs[cpart(k)], m.stepp, C.tickets + cpart(k));
+     }
+     if (phase == 1) return;
++    dmark(DP_A_CONTEXT, st);                  // CP: the peers' head groups over this rank's keys, partials out
+ #ifdef CP_F1A
+     {
+         static_assert(g6nr::NR - 1 <= 7, "VParts holds 7 partials");
+@@ -1658,7 +1664,9 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
+         cpglue::k_vget<<<G, 256, 0, st>>>(v, 0, m.stepp, part_of(v.src[0]), (size_t)M * H * 514 * 4);   // partials of MY heads
+     }
+ #endif
++    dmark(DP_A_MERGE, st);                    // CP: the wait for this rank's partials and their gets
+     G6RT_CK(g6_attn_cp_finish(a, cell, scr, sb, C.part_all, st));
++    dmark(DP_A_VPROJ, st);                    // CP: finish (merge + value project)
+     dmark(DP_ATTN, st);
+ #if G6_MODEL_ML4
+     ml4::compact((const __half*)a->output, b.heads, m.attn_c, M, st);
+-- 
+2.43.0
+

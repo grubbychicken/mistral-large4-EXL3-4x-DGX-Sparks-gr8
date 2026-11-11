@@ -1,0 +1,970 @@
+From cd5b197a3dbe3dbec1ee03133c4d7182d73e7d6d Mon Sep 17 00:00:00 2001
+From: grubbychicken <ben@grbychkn.com>
+Date: Mon, 9 Nov 2026 18:29:15 +0000
+Subject: [PATCH] ML4 M3 D2/D3: Mistral Large 4 DSpark draft head behind the
+ DFlash2 interface
+
+- runtime/ml4_dspark.cuh: the head (the pack author s TensorFold port, recipe docs/PORT.md section 9) on the TP4 split
+  of tools/ml4_dspark_pack.py: taps after layers 1/18/36/54/71, target_projection + gather, per draft layer the MLA-style
+  keys / values (YaRN rope) in a 4096-row ring, the 3-row block (bonus + 2 masks) through 3 layers with all-reduces,
+  the target head + the autoregressive head with cross-rank picks; prompt-context fill steps; 10 collectives
+- dflash.cuh: ML4 builds take that body, the sequence is shared; module_info: ML4 block 4 / 3 drafts, DFLASH2 cap
+- s2_batch.h: DFL_B is the planner ABI (8), a smaller drafter block fills its first rows
+
+Checked: full model on the ring, code-edit prompt, 400 greedy tokens, --dflash-k 3: 2.38 of 3 drafts accepted a round
+(the recipe reference D0: 2.43), 28.4 tok/s over the rounds without graphs (verify 108.9 ms + draft 8.7 ms); output
+equal to plain decoding for 360 tokens, then a near-tie (verify is not row-exact yet).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ engine/module_info.h          |   6 +-
+ engine/runtime/dflash.cuh     |   8 +
+ engine/runtime/g6m4.cu        |   2 +-
+ engine/runtime/ml4_dspark.cuh | 856 ++++++++++++++++++++++++++++++++++
+ engine/runtime/s2_batch.h     |   3 +-
+ 5 files changed, 870 insertions(+), 5 deletions(-)
+ create mode 100644 engine/runtime/ml4_dspark.cuh
+
+diff --git a/engine/module_info.h b/engine/module_info.h
+index 59a53ed..e366ad5 100644
+--- a/engine/module_info.h
++++ b/engine/module_info.h
+@@ -97,9 +97,9 @@ constexpr G6ModuleInfo make()
+     m.kv_row_bytes = g6kv::ROW;
+     m.kv_page = 64;
+     for (int i = 0; g6kv::NAME[i] && i < 15; ++i) m.kv_format[i] = g6kv::NAME[i];
+-    m.dfl_block = 8;      // dflash.cuh checks
++    m.dfl_block = G6_MODEL_ML4 ? 4 : 8;   // dflash.cuh checks (ML4: its DSpark head, ml4_dspark.cuh: the bonus token + 3 drafts)
+     m.pack_members = 8;   // s2/ds41_prefill.h checks
+-    m.dfl_drafts = 7;
++    m.dfl_drafts = G6_MODEL_ML4 ? 3 : 7;
+     m.dfl_rep = 8 % g6nr::NR != 0;   // NKV = 8
+     m.tp_sort = 2048;
+ #if defined(G6_KV4) && G6_KV4
+@@ -113,7 +113,7 @@ constexpr G6ModuleInfo make()
+     {
+     case G6_MODEL_ID_DS41: m.caps = G6_CAP_MTP0 | G6_CAP_PACK | G6_CAP_PARK | G6_CAP_PROMPT_DECODE | G6_CAP_DSPARK; break;
+     case G6_MODEL_ID_GLM53F: m.caps = G6_CAP_DFLASH2 | G6_CAP_FLASH_COST | G6_CAP_KDA | G6_CAP_GRAMMAR; break;
+-    case G6_MODEL_ID_ML4: m.caps = G6_CAP_MTP0; break;   // no draft head until DSpark (Stage 3 M3)
++    case G6_MODEL_ID_ML4: m.caps = G6_CAP_MTP0 | G6_CAP_DFLASH2; break;   // its DSpark head behind the DFlash2 interface (ml4_dspark.cuh)
+     default: m.caps = G6_CAP_DFLASH2 | G6_CAP_GRAMMAR; break;
+     }
+     return m;
+diff --git a/engine/runtime/dflash.cuh b/engine/runtime/dflash.cuh
+index 11155ac..453d949 100644
+--- a/engine/runtime/dflash.cuh
++++ b/engine/runtime/dflash.cuh
+@@ -40,6 +40,12 @@
+ #include "prefill.cuh"
+ #include "../module_info.h"
+ 
++#if G6_MODEL_ML4
++// Mistral Large 4: its DSpark head behind this interface (ml4_dspark.cuh); the sequence below is shared
++#include "ml4_dspark.cuh"
++namespace g6rt
++{
++#else
+ namespace g6rt
+ {
+ namespace dfl
+@@ -1129,6 +1135,8 @@ inline void dfl_attach(Model& m, Dfl& D)
+     m.dfl_tap = dfl_tap_launch;
+ }
+ 
++#endif   // !G6_MODEL_ML4
++
+ // ---------------------------------------------------------------- the sequence
+ // Prompt steps (rows past p.first, `chunk` rows per step) each feed the drafter their rows as context. The last one also
+ // drafts. Then rounds until n_gen tokens are committed:
+diff --git a/engine/runtime/g6m4.cu b/engine/runtime/g6m4.cu
+index 0429ef6..adfab02 100644
+--- a/engine/runtime/g6m4.cu
++++ b/engine/runtime/g6m4.cu
+@@ -2326,7 +2326,7 @@ int main(int argc, char** argv)
+         // DFlash2: Dfl::pf_feat holds one request's prefill taps, the last WIN prompt positions of the session whose
+         // prefill started last (dfl_owner; -1 = none, or a prefix-reuse hit that skipped part of the window, unless
+         // GR8_DFL_REUSE: then the rows from dfl_from)
+-        static_assert(s2::DFL_B == dfl::B, "s2_batch.h DFL_B follows dfl::B");
++        static_assert(s2::DFL_B >= dfl::B, "s2_batch.h DFL_B (the planner ABI, 8) holds dfl::B (ML4 DSpark: 4; the verified drafts come from --dflash-k)");
+         static_assert(s2::DFL_WIN == dfl::WIN && s2::DFL_RING == dfl::RING, "s2_batch.h DFL_WIN / DFL_RING follow dfl::WIN / RING");
+         int dfl_owner = -1;
+         int dfl_from = 0;                // the first window position the owner's prefill taps (GR8_DFL_REUSE: past a hit's rows)
+diff --git a/engine/runtime/ml4_dspark.cuh b/engine/runtime/ml4_dspark.cuh
+new file mode 100644
+index 0000000..c72e914
+--- /dev/null
++++ b/engine/runtime/ml4_dspark.cuh
+@@ -0,0 +1,856 @@
++// Mistral Large 4's DSpark draft head behind the DFlash2 drafter interface (dflash.cuh includes this file instead of its
++// own body in a G6_MODEL_ML4 build; g6m4's and S2's --dflash paths drive it unchanged). The recipe's docs/PORT.md
++// section 9 has the math (the pack author's TensorFold port; the recipe's tools/d0_dspark_ref.py is its PyTorch form):
++//   context  for every accepted row: features = the target residual after layers 1, 18, 36, 54, 71 (fp16, FEAT_SCALE)
++//            -> target_projection (this rank's 1536 outputs) -> all-gather (collective 0) -> RMS(target_norm) -> per
++//            draft layer j: kva = wkv_a x [576], latent = RMS(kva[:512], kv_norm), kvb = wkv_b latent (this rank's 16
++//            heads x [64 k_nope | 128 v]); key = [k_nope | YaRN rope(kva[512:], pos)], value -> the ring at pos
++//   block    3 rows at q0 .. q0+2: [emb(tok0), mask_0, mask_1], 3 layers: attention_norm, wq (16 heads x 128, rope on the
++//            last 64), the rows' own keys / values into the ring, attention over the ring's keys q0-2048 .. q0+2 (no mask
++//            in the block), wo partial -> all-reduce (collective 1 + 2j); ffn_norm, SwiGLU (this rank's 6144 of 24576),
++//            w2 partial -> all-reduce (2 + 2j); final_norm
++//   tokens   the target head on the 3 rows (this rank's vocab slice, softcap 30) + the autoregressive head, row by row:
++//            joint [state | emb_ar(prev) | h_i] -> joint_proj + b -> GRU-like state update -> output (this rank's slice)
++//            -> local best of head + markov -> all-gather of the picks (collective 7 + i) -> the draft (prev of row i+1)
++// The verify block is B = 4 rows (the bonus token + 3 drafts). Weights: tools/ml4_dspark_pack.py's rank pack (BF16W
++// records, gr8's BF16 GEMV on bf16 fragments).
++#pragma once
++#include "prefill.cuh"
++#include "../module_info.h"
++
++namespace g6rt
++{
++namespace dfl
++{
++constexpr int B = 4, K = B - 1;               // verify rows: the bonus token + 3 drafts
++static_assert(B == g6mod::INFO.dfl_block, "the drafter's block rows and the module description (module_info.h) differ");
++constexpr int Q = 3;                          // the draft block's rows (the trained three)
++constexpr int L = 3, NT = 5;                  // draft layers, tapped target layers
++constexpr int TAPS[NT] = {1, 18, 36, 54, 71};
++constexpr int HD = 128, NH = 64, NHR = NH / g6nr::NR, QW = NHR * HD;   // 16 heads a rank, 2048
++constexpr int DKVA = 576, LAT = 512, KVB = NHR * 192;
++constexpr int INTER = 24576, NIR = INTER / g6nr::NR;                   // 6144 a rank
++constexpr int NFR = HID / g6nr::NR;                                    // target_projection outputs a rank
++constexpr int JIN = 512 + 512 + HID, JOUT = 1536, ST = 512;
++constexpr int CR = MX;                        // context rows a draft step carries at most (a prompt step's chunk)
++constexpr int RING = 4096, WIN = 2048;
++constexpr int NC = 1 + 2 * L + Q;             // 0 tp slices, 1 + 2j / 2 + 2j layer j partials, 7 + i row i's picks
++constexpr int NPH = NC + 1;
++constexpr int SPLIT = 16;                     // attention key splits per head
++constexpr bool REP = false;                   // TP4 only
++constexpr float FEAT_SCALE = 1.f / 64.f;      // target residual -> fp16 features; target_projection is linear
++constexpr float SOFTCAP = 30.f;
++constexpr unsigned ERR = 0x64000000u;
++enum { C_ROWS, C_POS0, C_Q0, C_LO, C_N };
++static_assert(g6nr::NR == 4, "ML4 DSpark: the TP4 split (tools/ml4_dspark_pack.py)");
++static_assert(NT + 1 <= NC, "a fill step's NT feature gathers and its tp slices use collectives 0 .. NT");
++}
++
++struct DflIn
++{
++    u64 step;
++    int ctx_rows, ctx_pos0, q0, lo, tok0, query;
++    glue::SampleRow srow[dfl::B];     // unused (greedy drafts); kept for the callers
++};
++struct DflOut
++{
++    int tok[dfl::B];                  // tok[r] = draft for position q0 + r (r = 1..3)
++    float lp[dfl::B];                 // 0: the head reports no draft probabilities
++};
++struct DflMeta { int mask_id = 0, nr = 0, block = 0, layers = 0, window = 0; int tl[dfl::NT] = {}; float theta = 0, eps = 0; bool sel = false; };
++struct DLayer
++{
++    bind::Gv kva_c, kvb_c, kva_b, kvb_b, wq, wo, w1, w3, w2;
++    const __nv_bfloat16 *attn_norm = nullptr, *ffn_norm = nullptr, *kv_norm = nullptr;
++};
++struct Dfl
++{
++    int rank = -1;
++    bool sel = false;                 // the callers' selector switch: never on here
++    float sel_alpha = 1.f;
++    float eps = 1e-5f;
++    int tlayer[dfl::NT] = {};
++    g6::FabricDev f{};
++    u64* stepp = nullptr;
++    unsigned* tickets = nullptr;
++    const DflIn* in = nullptr;
++    DflOut* out = nullptr;
++    int nc = 0;
++    int* cell = nullptr;
++    int *tok = nullptr, *qpos = nullptr, *sel_tok = nullptr;
++    const __nv_bfloat16* emb = nullptr;      // the target's token embeddings
++    const int* emb_rows = nullptr;
++    float* freq = nullptr;                    // [32] YaRN
++    // weights
++    bind::Gv tp, jp, ar_out;
++    DLayer ly[dfl::L];
++    const __nv_bfloat16 *tnorm = nullptr, *fnorm = nullptr, *mask = nullptr, *jbias = nullptr, *ar_emb = nullptr;
++    // context
++    __half* feat = nullptr;           // [CR][NT][HID] fp16 x FEAT_SCALE
++    __half* pf_feat = nullptr;        // [WIN][NT][HID] prompt context rows written by the prefill (owner rows)
++    int pf_lo = 0, pf_hi = 0;
++    u32* xb_feat = nullptr;
++    float* tpo = nullptr;             // [CR][NFR]
++    __half* ctxn = nullptr;           // [CR][HID]
++    __half *ckva = nullptr, *clat = nullptr, *ckvb = nullptr;   // [CR][576], [CR][512], [CR][KVB]
++    u32 *xb_ctxn = nullptr, *xb_clat = nullptr;
++    __half *kring = nullptr, *vring = nullptr;                  // [L][NHR][RING][HD]
++    // block
++    float* resid = nullptr;           // [Q][HID]
++    __half* x = nullptr;              // [Q][HID] the current norm output
++    u32* xb_x = nullptr;
++    __half *bkva = nullptr, *blat = nullptr, *bkvb = nullptr, *q = nullptr;
++    u32* xb_blat = nullptr;
++    float* qf = nullptr;              // [Q][NHR][HD]
++    float* apart = nullptr;           // [NHR][SPLIT][Q][HD + 2]
++    __half* ao = nullptr;             // [Q][QW]
++    u32* xb_ao = nullptr;
++    uint16_t* part = nullptr;         // [Q][HID] BF16 partial
++    __half *g = nullptr, *u = nullptr, *act = nullptr;          // [Q][NIR]
++    u32* xb_act = nullptr;
++    // head
++    bind::Head head;
++    u32* xf_head = nullptr;
++    float* hlog = nullptr;            // [Q][vn]
++    __half* jin = nullptr;            // [JIN] (one row: fragments are per 16 rows)
++    u32* xb_jin = nullptr;
++    float* jpo = nullptr;             // [JOUT]
++    float* state = nullptr;           // [ST]
++    __half* markov = nullptr;         // [ST]
++    u32* xb_markov = nullptr;
++    float* arlog = nullptr;           // [vn]
++    int vlo = 0, vn = 0;
++};
++
++namespace dspk
++{
++using namespace dfl;
++__device__ __forceinline__ float bfr(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }   // a BF16 rounding
++
++struct InArgs { const uint32_t* in; u64* stepp; int* cell; int* tok; int* qpos; };
++__global__ void __launch_bounds__(128) k_in(InArgs a)
++{
++    __shared__ DflIn sh;
++    const int t = threadIdx.x;
++    for (int i = t; i < (int)(sizeof(DflIn) / 4); i += 128) reinterpret_cast<uint32_t*>(&sh)[i] = __ldcv(a.in + i);
++    __syncthreads();
++    if (t == 0)
++    {
++        *a.stepp = sh.step;
++        a.cell[C_ROWS] = sh.ctx_rows; a.cell[C_POS0] = sh.ctx_pos0; a.cell[C_Q0] = sh.q0; a.cell[C_LO] = sh.lo;
++        a.tok[0] = sh.tok0;
++    }
++    if (t < Q) a.qpos[t] = sh.q0 + t;
++}
++// YaRN interleaved-pair frequencies (tf_large4_dspark_frequency): theta 1e4, factor 2048, original 512, beta 32 / 1
++__global__ void k_freq(float* out, float low, float high)
++{
++    const int i = threadIdx.x;
++    if (i >= 32) return;
++    const float base = powf(10000.f, float(2 * i) / 64.f), ramp = fminf(1.f, fmaxf(0.f, (float(i) - low) / (high - low)));
++    out[i] = (1.f / (2048.f * base)) * ramp + (1.f / base) * (1.f - ramp);
++}
++// element d (0..63) of rope(x[0..63]) at pos: GPT-J interleaved pairs, fp32 trig (the reference's rotate)
++__device__ __forceinline__ float rope_at(const __half* x, const float* freq, int d, int pos)
++{
++    const int p = d >> 1;
++    const float ang = float(pos) * freq[p], co = cosf(ang), si = sinf(ang);
++    const float ev = __half2float(x[2 * p]), od = __half2float(x[2 * p + 1]);
++    return (d & 1) ? od * co + ev * si : ev * co - od * si;
++}
++// target residual rows -> fp16 features of tap slot s. grid (HID / 256, M), block 256
++__global__ void __launch_bounds__(256) k_tap(const float* resid, __half* feat, int s)
++{
++    const int m = blockIdx.y, c = blockIdx.x * 256 + threadIdx.x;
++    feat[((size_t)m * NT + s) * HID + c] = __float2half_rn(resid[(size_t)m * HID + c] * FEAT_SCALE);
++}
++// prefill rows r0 .. r0+rows-1 whose positions fall in [lo, hi) -> pf_feat[pos - lo], tap slot s
++__global__ void __launch_bounds__(256) k_pf_tap(const float* resid, const int* pos, int r0, int lo, int hi, __half* pf, int s)
++{
++    const int m = r0 + blockIdx.y, c = blockIdx.x * 256 + threadIdx.x, p = pos[m];
++    if (p < lo || p >= hi) return;
++    pf[((size_t)(p - lo) * NT + s) * HID + c] = __float2half_rn(resid[(size_t)m * HID + c] * FEAT_SCALE);
++}
++// one block per row: RMS of a [rows][K] fp32 or fp16 row with a BF16 weight -> fp16. src16 or src32 is null.
++__global__ void __launch_bounds__(256) k_rms(const float* src32, const __half* src16, int lds, int K, const __nv_bfloat16* w, float eps,
++                                             __half* out, int ldo, const int* rows_cell)
++{
++    const int m = blockIdx.x;
++    if (rows_cell && m >= *rows_cell) return;
++    __shared__ float sh[8];
++    float ss = 0.f;
++    for (int c = threadIdx.x; c < K; c += 256)
++    {
++        const float v = src32 ? src32[(size_t)m * lds + c] : __half2float(src16[(size_t)m * lds + c]);
++        ss += v * v;
++    }
++    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
++    if ((threadIdx.x & 31) == 0) sh[threadIdx.x >> 5] = ss;
++    __syncthreads();
++    float tot = 0.f;
++    for (int i = 0; i < 8; ++i) tot += sh[i];
++    const float inv = rsqrtf(tot / float(K) + eps);
++    for (int c = threadIdx.x; c < K; c += 256)
++    {
++        const float v = src32 ? src32[(size_t)m * lds + c] : __half2float(src16[(size_t)m * lds + c]);
++        out[(size_t)m * ldo + c] = __float2half_rn(v * inv * __bfloat162float(w[c]));
++    }
++}
++// collective c: every rank's [CR][NFR] fp32 tp outputs -> the full rows / FEAT_SCALE -> RMS(target_norm) -> ctxn. One
++// block per context row (rows past the cell's count are skipped)
++struct CtxArgs { g6::FabricDev f; const u64* stepp; int c; const __nv_bfloat16* w; __half* out; float eps; const int* cell; };
++__global__ void __launch_bounds__(256) k_ctx_norm(CtxArgs a)
++{
++    const u64 step = *a.stepp;
++    const int m = blockIdx.x;
++    if (m >= a.cell[C_ROWS]) return;
++    __shared__ float sh[8];
++    auto at = [&](int c) {
++        const int p = c / NFR;
++        return __ldcv(reinterpret_cast<const float*>(glue::peer_slot(a.f, step, a.c, p)) + (size_t)m * NFR + (c - p * NFR)) / FEAT_SCALE;
++    };
++    float ss = 0.f;
++    for (int c = threadIdx.x; c < HID; c += 256) { const float v = at(c); ss += v * v; }
++    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
++    if ((threadIdx.x & 31) == 0) sh[threadIdx.x >> 5] = ss;
++    __syncthreads();
++    float tot = 0.f;
++    for (int i = 0; i < 8; ++i) tot += sh[i];
++    const float inv = rsqrtf(tot / float(HID) + a.eps);
++    for (int c = threadIdx.x; c < HID; c += 256) a.out[(size_t)m * HID + c] = __float2half_rn(at(c) * inv * __bfloat162float(a.w[c]));
++}
++// keys / values of rows (context: positions pos0 + row for row < cell rows; block: qpos[row]) -> the ring of layer j.
++// grid (rows, NHR), block 128 (thread = dimension)
++struct KvArgs { const __half *kva, *kvb; const float* freq; __half *kr, *vr; const int* cell; const int* qpos; int ctx; };
++__global__ void __launch_bounds__(128) k_kv(KvArgs a)
++{
++    const int m = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
++    if (a.ctx && m >= a.cell[C_ROWS]) return;
++    const int pos = a.ctx ? a.cell[C_POS0] + m : a.qpos[m];
++    const __half* e = a.kvb + (size_t)m * KVB + h * 192;
++    const float k = d < 64 ? __half2float(e[d]) : rope_at(a.kva + (size_t)m * DKVA + LAT, a.freq, d - 64, pos);
++    const size_t o = ((size_t)h * RING + (pos & (RING - 1))) * HD + d;
++    a.kr[o] = __float2half_rn(k);
++    a.vr[o] = e[64 + d];
++}
++// the block's queries: q [Q][NHR][HD] -> nope as is, rope on dims 64..127 at qpos. grid (Q, NHR), block 128
++__global__ void __launch_bounds__(128) k_q(const __half* q, const float* freq, const int* qpos, float* qf)
++{
++    const int r = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
++    const __half* x = q + (size_t)r * QW + h * HD;
++    qf[((size_t)r * NHR + h) * HD + d] = d < 64 ? __half2float(x[d]) : rope_at(x + 64, freq, d - 64, qpos[r]);
++}
++// attention of the Q block rows over ring positions [max(lo, q0 - WIN), q0 + Q), split over SPLIT key ranges; each warp
++// an online softmax over its keys (lane = 4 dimensions), the warps merged per split. grid (NHR, SPLIT), block 128.
++// part [h][split][r][HD + 2]: max, sum, unnormalized output
++struct AttnArgs { const float* qf; const __half *kr, *vr; const int* cell; float* part; };
++__global__ void __launch_bounds__(128) k_attn(AttnArgs a)
++{
++    __shared__ float sm[4][Q][HD + 2];
++    const int h = blockIdx.x, split = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int q0 = a.cell[C_Q0], k0 = max(a.cell[C_LO], q0 - WIN), n = q0 + Q - k0;
++    const int chunk = (n + SPLIT - 1) / SPLIT, s0 = split * chunk, s1 = min(n, s0 + chunk);
++    const float scale = rsqrtf(128.f);
++    float q[Q][4], m[Q], l[Q], acc[Q][4];
++    #pragma unroll
++    for (int r = 0; r < Q; ++r)
++    {
++        #pragma unroll
++        for (int j = 0; j < 4; ++j) { q[r][j] = a.qf[((size_t)r * NHR + h) * HD + lane * 4 + j]; acc[r][j] = 0.f; }
++        m[r] = -INFINITY; l[r] = 0.f;
++    }
++    for (int t = s0 + warp; t < s1; t += 4)
++    {
++        const int pos = k0 + t;
++        const size_t o = ((size_t)h * RING + (pos & (RING - 1))) * HD + lane * 4;
++        const uint2 kv = *reinterpret_cast<const uint2*>(a.kr + o), vv = *reinterpret_cast<const uint2*>(a.vr + o);
++        const __half* kk = reinterpret_cast<const __half*>(&kv);
++        const __half* vh = reinterpret_cast<const __half*>(&vv);
++        #pragma unroll
++        for (int r = 0; r < Q; ++r)
++        {
++            float s = q[r][0] * __half2float(kk[0]) + q[r][1] * __half2float(kk[1]) + q[r][2] * __half2float(kk[2]) + q[r][3] * __half2float(kk[3]);
++            for (int x = 16; x > 0; x >>= 1) s += __shfl_xor_sync(0xffffffffu, s, x);
++            s *= scale;
++            const float mn = fmaxf(m[r], s), corr = expf(m[r] - mn), p = expf(s - mn);
++            l[r] = l[r] * corr + p;
++            #pragma unroll
++            for (int j = 0; j < 4; ++j) acc[r][j] = acc[r][j] * corr + p * __half2float(vh[j]);
++            m[r] = mn;
++        }
++    }
++    #pragma unroll
++    for (int r = 0; r < Q; ++r)
++    {
++        if (lane == 0) { sm[warp][r][0] = m[r]; sm[warp][r][1] = l[r]; }
++        #pragma unroll
++        for (int j = 0; j < 4; ++j) sm[warp][r][2 + lane * 4 + j] = acc[r][j];
++    }
++    __syncthreads();
++    const int d = threadIdx.x;
++    for (int r = 0; r < Q; ++r)
++    {
++        float mx = -INFINITY;
++        for (int w = 0; w < 4; ++w) mx = fmaxf(mx, sm[w][r][0]);
++        float sum = 0.f, o = 0.f;
++        if (mx != -INFINITY)
++            for (int w = 0; w < 4; ++w)
++                if (sm[w][r][0] != -INFINITY) { const float e = expf(sm[w][r][0] - mx); sum += sm[w][r][1] * e; o += sm[w][r][2 + d] * e; }
++        float* p = a.part + (((size_t)h * SPLIT + split) * Q + r) * (HD + 2);
++        if (d == 0) { p[0] = mx; p[1] = sum; }
++        p[2 + d] = o;
++    }
++}
++// the splits merged -> ao [Q][QW] fp16. grid NHR, block 128
++__global__ void __launch_bounds__(128) k_attn_join(const float* part, __half* ao)
++{
++    const int h = blockIdx.x, d = threadIdx.x;
++    for (int r = 0; r < Q; ++r)
++    {
++        float mx = -INFINITY;
++        for (int s = 0; s < SPLIT; ++s) mx = fmaxf(mx, part[(((size_t)h * SPLIT + s) * Q + r) * (HD + 2)]);
++        float sum = 0.f, o = 0.f;
++        for (int s = 0; s < SPLIT; ++s)
++        {
++            const float* p = part + (((size_t)h * SPLIT + s) * Q + r) * (HD + 2);
++            if (p[0] == -INFINITY) continue;
++            const float e = expf(p[0] - mx);
++            sum += p[1] * e; o += p[2 + d] * e;
++        }
++        ao[(size_t)r * QW + h * HD + d] = __float2half_rn(o / sum);
++    }
++}
++// the block's rows: [emb(tok0), mask_0, mask_1] -> resid (fp32), and x = RMS(row, w). grid Q, block 256
++__global__ void __launch_bounds__(256) k_block_in(const __nv_bfloat16* emb, const int* tok, const __nv_bfloat16* mask, float* resid)
++{
++    const int r = blockIdx.x;
++    const __nv_bfloat16* src = r == 0 ? emb + (size_t)tok[0] * HID : mask + (size_t)(r - 1) * HID;
++    for (int c = threadIdx.x; c < HID; c += 256) resid[(size_t)r * HID + c] = __bfloat162float(src[c]);
++}
++// collective c: the ranks' BF16 partials [Q][HID] summed in rank order, added to resid, then x = RMS(resid, w). grid Q, block 256
++struct SumArgs { g6::FabricDev f; const u64* stepp; int c; float* resid; const __nv_bfloat16* w; __half* x; float eps; };
++__global__ void __launch_bounds__(256) k_sum_norm(SumArgs a)
++{
++    const u64 step = *a.stepp;
++    const int r = blockIdx.x;
++    __shared__ float sh[8];
++    float ss = 0.f;
++    for (int c = threadIdx.x; c < HID; c += 256)
++    {
++        float s = 0.f;
++        for (int p = 0; p < g6nr::NR; ++p)
++            s += __bfloat162float(__ldcv(reinterpret_cast<const __nv_bfloat16*>(glue::peer_slot(a.f, step, a.c, p)) + (size_t)r * HID + c));
++        const float v = a.resid[(size_t)r * HID + c] + s;
++        a.resid[(size_t)r * HID + c] = v;
++        ss += v * v;
++    }
++    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
++    if ((threadIdx.x & 31) == 0) sh[threadIdx.x >> 5] = ss;
++    __syncthreads();
++    float tot = 0.f;
++    for (int i = 0; i < 8; ++i) tot += sh[i];
++    const float inv = rsqrtf(tot / float(HID) + a.eps);
++    for (int c = threadIdx.x; c < HID; c += 256)
++        a.x[(size_t)r * HID + c] = __float2half_rn(a.resid[(size_t)r * HID + c] * inv * __bfloat162float(a.w[c]));
++}
++__global__ void __launch_bounds__(256) k_swiglu(const __half* g, const __half* u, __half* out, int n)
++{
++    const int i = blockIdx.x * 256 + threadIdx.x;
++    if (i >= n) return;
++    const float x = __half2float(g[i]);
++    out[i] = __float2half_rn(x / (1.f + expf(-x)) * __half2float(u[i]));
++}
++__global__ void __launch_bounds__(256) k_softcap(float* y, int n)
++{
++    const int i = blockIdx.x * 256 + threadIdx.x;
++    if (i < n) y[i] = SOFTCAP * tanhf(y[i] / SOFTCAP);
++}
++// the autoregressive head's input of row i: [state | emb_ar(prev) | x_i], prev = tok0 (i = 0) or row i-1's draft
++__global__ void __launch_bounds__(256) k_joint(const float* state, const __nv_bfloat16* ar_emb, const __half* x, const int* tok,
++                                               const int* sel, int i, __half* jin)
++{
++    int prev = i == 0 ? tok[0] : sel[i - 1];
++    if (prev < 0 || prev >= glue::VOCAB) prev = 0;
++    for (int c = threadIdx.x; c < JIN; c += 256)
++        jin[c] = c < ST ? __float2half_rn(state[c])
++                        : c < 2 * ST ? __float2half_rn(__bfloat162float(ar_emb[(size_t)prev * ST + c - ST])) : x[(size_t)i * HID + c - 2 * ST];
++}
++// the GRU-like step with the reference's BF16 stages (tf_large4_dspark_rnn); i == 0 starts from a zero state
++__global__ void __launch_bounds__(256) k_rnn(const float* jp, const __nv_bfloat16* bias, float* state, __half* markov, int i)
++{
++    for (int c = threadIdx.x; c < ST; c += 256)
++    {
++        const float s0 = i == 0 ? 0.f : state[c];
++        const float g = bfr(1.f / (1.f + expf(-bfr(jp[c] + __bfloat162float(bias[c])))));
++        const float cand = bfr(tanhf(bfr(jp[ST + c] + __bfloat162float(bias[ST + c]))));
++        const float o = bfr(tanhf(bfr(jp[2 * ST + c] + __bfloat162float(bias[2 * ST + c]))));
++        const float first = bfr(g * s0), second = bfr(bfr(1.f - g) * cand);
++        state[c] = bfr(first + second);
++        markov[c] = __float2half_rn(o);
++    }
++}
++struct Pick { float value; int id; int bad; int pad; };
++// this rank's best of head + markov over its vocab slice (the markov logits rounded to BF16 as the reference stores
++// them; the lowest id on a tie) -> its send slot of collective c. grid 1, block 1024
++__global__ void __launch_bounds__(1024) k_pick(const float* hlog, const float* arlog, int vn, int vlo, g6::FabricDev f, const u64* stepp,
++                                               int c, unsigned* ticket)
++{
++    __shared__ float bv[32];
++    __shared__ int bi[32], bb[32];
++    float val = -INFINITY;
++    int id = 0x7fffffff, bad = 0;
++    for (int j = threadIdx.x; j < vn; j += 1024)
++    {
++        const float x = hlog[j] + bfr(arlog[j]);
++        if (!isfinite(x)) bad = 1;
++        if (x > val || (x == val && j < id)) { val = x; id = j; }
++    }
++    for (int o = 16; o > 0; o >>= 1)
++    {
++        const float ov = __shfl_xor_sync(0xffffffffu, val, o);
++        const int oi = __shfl_xor_sync(0xffffffffu, id, o);
++        bad |= __shfl_xor_sync(0xffffffffu, bad, o);
++        if (ov > val || (ov == val && oi < id)) { val = ov; id = oi; }
++    }
++    if ((threadIdx.x & 31) == 0) { bv[threadIdx.x >> 5] = val; bi[threadIdx.x >> 5] = id; bb[threadIdx.x >> 5] = bad; }
++    __syncthreads();
++    if (threadIdx.x == 0)
++    {
++        for (int w = 1; w < 32; ++w)
++        {
++            bad |= bb[w];
++            if (bv[w] > val || (bv[w] == val && bi[w] < id)) { val = bv[w]; id = bi[w]; }
++        }
++        const u64 step = *stepp;
++        Pick* p = reinterpret_cast<Pick*>(glue::send_slot(f, step, c));
++        p->value = val; p->id = vlo + id; p->bad = bad; p->pad = 0;
++        glue::publish(f, c, g6::coll_seq(step, c, f.ncoll), ticket);
++    }
++}
++// the ranks' picks of collective c -> the draft of row i (the larger value, the lower id on a tie; -1 when any is bad)
++__global__ void k_pick_merge(g6::FabricDev f, const u64* stepp, int c, int* sel, int i)
++{
++    if (threadIdx.x) return;
++    const u64 step = *stepp;
++    int bad = 0, id = 0x7fffffff;
++    float val = -INFINITY;
++    for (int p = 0; p < g6nr::NR; ++p)
++    {
++        const Pick* q = reinterpret_cast<const Pick*>(glue::peer_slot(f, step, c, p));
++        const float v = __ldcv(&q->value);
++        const int d = __ldcv(&q->id);
++        bad |= __ldcv(&q->bad);
++        if (v > val || (v == val && d < id)) { val = v; id = d; }
++    }
++    sel[i] = bad ? -1 : id;
++}
++__global__ void k_out(const int* sel, DflOut* out)
++{
++    if (threadIdx.x) return;
++    out->tok[0] = 0; out->lp[0] = 0.f;
++    for (int r = 1; r < B; ++r) { out->tok[r] = sel[r - 1]; out->lp[r] = 0.f; }
++}
++// a fill step: this rank's prompt-context rows of tap slot s (zero where it is not the owner) -> collective s. grid 1, block 128
++__global__ void __launch_bounds__(128) k_fill_put(const __half* pf, const int* cell, int s, g6::FabricDev f, const u64* stepp, unsigned* ticket)
++{
++    const u64 step = *stepp;
++    const int rows = cell[C_ROWS], p0 = cell[C_POS0] - cell[C_LO];
++    uint4* dst = reinterpret_cast<uint4*>(glue::send_slot(f, step, s));
++    constexpr int W = HID * 2 / 16;
++    for (int i = threadIdx.x; i < B * W; i += 128)
++    {
++        const int m = i / W, w = i % W;
++        dst[i] = m < rows ? reinterpret_cast<const uint4*>(pf + ((size_t)(p0 + m) * NT + s) * HID)[w] : make_uint4(0, 0, 0, 0);
++    }
++    glue::publish(f, s, g6::coll_seq(step, s, f.ncoll), ticket);
++}
++// the ranks' rows summed (exactly one is non-zero) -> feat. grid (HID / 256, B, NT), block 256
++__global__ void __launch_bounds__(256) k_fill_get(g6::FabricDev f, const u64* stepp, __half* feat)
++{
++    const u64 step = *stepp;
++    const int c = blockIdx.x * 256 + threadIdx.x, m = blockIdx.y, s = blockIdx.z;
++    float v = 0.f;
++    for (int p = 0; p < g6nr::NR; ++p)
++        v += __half2float(__ldcv(reinterpret_cast<const __half*>(glue::peer_slot(f, step, s, p)) + (size_t)m * HID + c));
++    feat[((size_t)m * NT + s) * HID + c] = __float2half_rn(v);
++}
++}   // namespace dspk
++
++inline DflMeta dfl_read_meta(const Find& find)
++{
++    const TensorRef t = find("DS.tp.gv");
++    if (!t.p) die("--dflash-manifest: not an ML4 DSpark pack (no DS.tp.gv; the recipe's tools/ml4_dspark_pack.py)");
++    DflMeta m;
++    m.nr = g6nr::NR; m.block = dfl::B; m.layers = dfl::L; m.window = dfl::WIN; m.eps = 1e-5f;
++    for (int i = 0; i < dfl::NT; ++i) m.tl[i] = dfl::TAPS[i];
++    return m;
++}
++inline void dfl_build(Dfl& D, const Model& main, const Find& find, const DflMeta& meta, const g6::FabricDev& f, u64* stepp, bool sel,
++                      cudaStream_t st, bool pf = false)
++{
++    using namespace dfl;
++    if (sel) die("ML4 DSpark: no selector (--dflash-sel 1)");
++    if (f.ncoll != NC || f.stride < (size_t)CR * NFR * 4 + 8 || f.stride < (size_t)B * HID * 2 + 8) die("ML4 DSpark fabric: wrong collective count or slot size");
++    D.rank = main.rank; D.f = f; D.stepp = stepp; D.eps = meta.eps;
++    for (int i = 0; i < NT; ++i) D.tlayer[i] = meta.tl[i];
++    D.emb = main.emb;
++    D.tickets = dmalloc<unsigned>(NC);
++    D.cell = dmalloc<int>(C_N);
++    D.tok = dmalloc<int>(B);
++    D.qpos = dmalloc<int>(B);
++    D.sel_tok = dmalloc<int>(Q);
++    D.freq = dmalloc<float>(32);
++    {   // the YaRN ramp's ends (the reference's yarnEndpoints)
++        const double orig = 512, th = 10000;
++        double lo = std::max(std::floor(64 * std::log(orig / (32 * 2 * M_PI)) / (2 * std::log(th))), 0.0);
++        double hi = std::min(std::ceil(64 * std::log(orig / (1 * 2 * M_PI)) / (2 * std::log(th))), 63.0);
++        if (lo == hi) hi += 0.001;
++        dspk::k_freq<<<1, 32, 0, st>>>(D.freq, (float)lo, (float)hi);
++    }
++    auto frag = [&](int k) { return dmalloc<u32>((size_t)g6mx::NT * k / 16 * 64); };
++    D.feat = dmalloc<__half>((size_t)CR * NT * HID);
++    if (pf) D.pf_feat = dmalloc<__half>((size_t)WIN * NT * HID);
++    D.xb_feat = frag(NT * HID);
++    D.tpo = dmalloc<float>((size_t)CR * NFR);
++    D.ctxn = dmalloc<__half>((size_t)CR * HID);
++    D.ckva = dmalloc<__half>((size_t)CR * DKVA);
++    D.clat = dmalloc<__half>((size_t)CR * LAT);
++    D.ckvb = dmalloc<__half>((size_t)CR * KVB);
++    D.xb_ctxn = frag(HID); D.xb_clat = frag(LAT);
++    D.kring = dmalloc<__half>((size_t)L * NHR * RING * HD);
++    D.vring = dmalloc<__half>((size_t)L * NHR * RING * HD);
++    D.resid = dmalloc<float>((size_t)Q * HID);
++    D.x = dmalloc<__half>((size_t)Q * HID);
++    D.xb_x = frag(HID);
++    D.bkva = dmalloc<__half>((size_t)Q * DKVA);
++    D.blat = dmalloc<__half>((size_t)Q * LAT);
++    D.bkvb = dmalloc<__half>((size_t)Q * KVB);
++    D.xb_blat = frag(LAT);
++    D.q = dmalloc<__half>((size_t)Q * QW);
++    D.qf = dmalloc<float>((size_t)Q * QW);
++    D.apart = dmalloc<float>((size_t)NHR * SPLIT * Q * (HD + 2));
++    D.ao = dmalloc<__half>((size_t)Q * QW);
++    D.xb_ao = frag(QW);
++    D.part = dmalloc<uint16_t>((size_t)Q * HID);
++    D.g = dmalloc<__half>((size_t)Q * NIR);
++    D.u = dmalloc<__half>((size_t)Q * NIR);
++    D.act = dmalloc<__half>((size_t)Q * NIR);
++    D.xb_act = frag(NIR);
++    D.xf_head = frag(HID);
++    D.vlo = main.vlo; D.vn = main.vn;
++    D.hlog = dmalloc<float>((size_t)Q * D.vn);
++    D.jin = dmalloc<__half>((size_t)16 * JIN);   // fragment tiles are 16 rows: rows 1..15 stay zero
++    G6RT_CK(cudaMemsetAsync(D.jin, 0, (size_t)16 * JIN * 2, st));
++    D.xb_jin = frag(JIN);
++    D.jpo = dmalloc<float>(JOUT);
++    D.state = dmalloc<float>(ST);
++    D.markov = dmalloc<__half>((size_t)16 * ST);
++    G6RT_CK(cudaMemsetAsync(D.markov, 0, (size_t)16 * ST * 2, st));
++    D.xb_markov = frag(ST);
++    D.arlog = dmalloc<float>(D.vn);
++    auto gv = [&](const std::string& name, int tpc, int ks, int M, const u32* xb, void* y, int odt, int K_, int O_, bind::Gv& g) {
++        const TensorRef t = find(name);
++        if (!t.p || t.nd != 3 || t.shape[2] != 512) die("ML4 DSpark pack: " + name + " is not a BF16W record");
++        if (const char* e = bind::make_gv(as_bind(t), bind::BF16W, tpc, ks, M, xb, y, odt, g)) die(name + ": " + e);
++        if (g.K != K_ || g.O != O_) die("ML4 DSpark pack: " + name + " is [" + std::to_string(g.O) + "][" + std::to_string(g.K) + "], want [" +
++                                        std::to_string(O_) + "][" + std::to_string(K_) + "]");
++    };
++    auto vec = [&](const std::string& name, long long n) {
++        const TensorRef t = find(name);
++        if (!t.p || !t.bf16) die("ML4 DSpark pack has no BF16 " + name);
++        long long c = 1;
++        for (int i = 0; i < t.nd; ++i) c *= t.shape[i];
++        if (c != n) die("ML4 DSpark pack: " + name + " has " + std::to_string(c) + " values, want " + std::to_string(n));
++        return static_cast<const __nv_bfloat16*>(t.p);
++    };
++    gv("DS.tp.gv", 1, 32, CR, D.xb_feat, D.tpo, gv::O_F32, NT * HID, NFR, D.tp);
++    D.tnorm = vec("DS.target_norm", HID);
++    D.fnorm = vec("DS.final_norm", HID);
++    D.mask = vec("DS.mask", 2LL * HID);
++    for (int j = 0; j < L; ++j)
++    {
++        DLayer& y = D.ly[j];
++        const std::string p = "DS.L" + std::to_string(j) + ".";
++        gv(p + "kva.gv", 1, 32, CR, D.xb_ctxn, D.ckva, gv::O_F16, HID, DKVA, y.kva_c);
++        gv(p + "kvb.gv", 1, 32, CR, D.xb_clat, D.ckvb, gv::O_F16, LAT, KVB, y.kvb_c);
++        gv(p + "kva.gv", 1, 32, Q, D.xb_x, D.bkva, gv::O_F16, HID, DKVA, y.kva_b);
++        gv(p + "kvb.gv", 1, 32, Q, D.xb_blat, D.bkvb, gv::O_F16, LAT, KVB, y.kvb_b);
++        gv(p + "wq.gv", 1, 16, Q, D.xb_x, D.q, gv::O_F16, HID, QW, y.wq);
++        gv(p + "wo.gv", 2, 8, Q, D.xb_ao, D.part, gv::O_BF16, QW, HID, y.wo);
++        gv(p + "w1.gv", 2, 16, Q, D.xb_x, D.g, gv::O_F16, HID, NIR, y.w1);
++        gv(p + "w3.gv", 2, 16, Q, D.xb_x, D.u, gv::O_F16, HID, NIR, y.w3);
++        gv(p + "w2.gv", 2, 8, Q, D.xb_act, D.part, gv::O_BF16, NIR, HID, y.w2);
++        y.attn_norm = vec(p + "attn_norm", HID);
++        y.ffn_norm = vec(p + "ffn_norm", HID);
++        y.kv_norm = vec(p + "kv_norm", LAT);
++    }
++    gv("DS.jp.gv", 1, 32, 1, D.xb_jin, D.jpo, gv::O_F32, JIN, JOUT, D.jp);
++    D.jbias = vec("DS.jp_bias", JOUT);
++    gv("DS.ar_out.gv", 1, 32, 1, D.xb_markov, D.arlog, gv::O_F32, ST, D.vn, D.ar_out);
++    D.ar_emb = vec("DS.ar_emb", (long long)glue::VOCAB * ST);
++    // the target's lm_head on the draft's final-norm rows
++    bind::HeadTensors ht = main.head_t;
++    ht.eh = bind::Tensor();
++    bind::Scratch sc{};
++    sc.xf_head = D.xf_head;
++    bind::HeadIo io;
++    io.h = D.x; io.logits = D.hlog;
++    if (const char* e = bind::make_head(ht, D.rank, Q, sc, io, D.head)) die(std::string("ML4 DSpark head: ") + e);
++    G6RT_CK(cudaStreamSynchronize(st));
++    size_t wb = bind::gv_bytes(D.tp) + bind::gv_bytes(D.jp) + bind::gv_bytes(D.ar_out);
++    for (const DLayer& y : D.ly) wb += bind::gv_bytes(y.kva_c) + bind::gv_bytes(y.kvb_c) + bind::gv_bytes(y.wq) + bind::gv_bytes(y.wo) +
++                                       bind::gv_bytes(y.w1) + bind::gv_bytes(y.w3) + bind::gv_bytes(y.w2);
++    fprintf(stderr, "# rank %d: ML4 DSpark drafter (3 drafts a round), records %.3f GB, ring %.1f MB, prompt taps %.1f MB\n", D.rank,
++            wb / 1e9, 2.0 * L * NHR * RING * HD * 2 / 1e6, pf ? (double)WIN * NT * HID * 2 / 1e6 : 0.0);
++}
++inline void dfl_head_i4(Dfl&, const uint8_t*, int, int) { die("GR8_DFL_HEAD_I4: not with the ML4 DSpark head"); }
++inline void dfl_body_i4(Dfl&, cudaStream_t) { die("GR8_DFL_BODY_I4: not with the ML4 DSpark head"); }
++
++// ---------------------------------------------------------------- the step, in phases
++inline void dfl_bfrag(const __half* src, int K_, int M, u32* b16, cudaStream_t st)
++{
++    bind::Xfrag a;
++    a.on = 1; a.src = src; a.ld = K_; a.K = K_; a.M = M; a.f16 = nullptr; a.bf16 = b16;
++    bind::launch(a, st);
++}
++inline void dfl_put(Dfl& D, int c, cudaStream_t st)
++{
++    k_put_publish<<<1, 128, 0, st>>>(reinterpret_cast<const uint4*>(D.part), D.f, D.stepp, c, dfl::Q * (HID * 2 / 16), D.tickets + c);
++}
++inline void dfl_wait(Dfl& D, int c, size_t bytes, cudaStream_t st) { glue::k_wait_peers<<<1, 32, 0, st>>>(D.f, D.stepp, c, bytes, dfl::ERR); }
++inline size_t dfl_payload(const Dfl& D, int c)
++{
++    (void)D;
++    using namespace dfl;
++    if (c == 0) return (size_t)CR * NFR * 4;
++    if (c <= 2 * L) return (size_t)Q * HID * 2;
++    return sizeof(dspk::Pick);
++}
++inline std::vector<uint32_t> dfl_sizes(const Dfl& D, bool query)
++{
++    std::vector<uint32_t> v;
++    for (int c = 0; c < (query ? dfl::NC : 1); ++c) v.push_back((uint32_t)dfl_payload(D, c));
++    return v;
++}
++inline std::vector<uint32_t> dfl_fill_sizes()
++{
++    std::vector<uint32_t> v(dfl::NT, (uint32_t)(dfl::B * HID * 2));
++    v.push_back((uint32_t)(dfl::CR * dfl::NFR * 4));
++    return v;
++}
++inline void dfl_enqueue(g6::Fabric& f, u64 step, const std::vector<uint32_t>& sizes, bool fill)
++{
++    (void)fill;
++    f.enqueue_step(step, sizes);
++}
++// the context part from collective c (tp slices): target_norm, every layer's keys / values of the context rows -> ring
++inline void dfl_ctx_store(Dfl& D, int c, cudaStream_t st)
++{
++    using namespace dfl;
++    dfl_wait(D, c, (size_t)CR * NFR * 4, st);
++    dspk::k_ctx_norm<<<CR, 256, 0, st>>>(dspk::CtxArgs{D.f, D.stepp, c, D.tnorm, D.ctxn, D.eps, D.cell});
++    dfl_bfrag(D.ctxn, HID, CR, D.xb_ctxn, st);
++    for (int j = 0; j < L; ++j)
++    {
++        DLayer& y = D.ly[j];
++        bind::launch(y.kva_c, st);
++        dspk::k_rms<<<CR, 256, 0, st>>>(nullptr, D.ckva, DKVA, LAT, y.kv_norm, D.eps, D.clat, LAT, D.cell + C_ROWS);
++        dfl_bfrag(D.clat, LAT, CR, D.xb_clat, st);
++        bind::launch(y.kvb_c, st);
++        dspk::k_kv<<<dim3(CR, NHR), 128, 0, st>>>(dspk::KvArgs{D.ckva, D.ckvb, D.freq, D.kring + (size_t)j * NHR * RING * HD,
++                                                               D.vring + (size_t)j * NHR * RING * HD, D.cell, D.qpos, 1});
++    }
++}
++// attention block of layer j (x = its attention_norm output) up to the publish of collective 1 + 2j
++inline void dfl_attn(Dfl& D, int j, cudaStream_t st)
++{
++    using namespace dfl;
++    DLayer& y = D.ly[j];
++    dfl_bfrag(D.x, HID, Q, D.xb_x, st);
++    bind::launch(y.wq, st);
++    bind::launch(y.kva_b, st);
++    dspk::k_q<<<dim3(Q, NHR), 128, 0, st>>>(D.q, D.freq, D.qpos, D.qf);
++    dspk::k_rms<<<Q, 256, 0, st>>>(nullptr, D.bkva, DKVA, LAT, y.kv_norm, D.eps, D.blat, LAT, nullptr);
++    dfl_bfrag(D.blat, LAT, Q, D.xb_blat, st);
++    bind::launch(y.kvb_b, st);
++    __half *kr = D.kring + (size_t)j * NHR * RING * HD, *vr = D.vring + (size_t)j * NHR * RING * HD;
++    dspk::k_kv<<<dim3(Q, NHR), 128, 0, st>>>(dspk::KvArgs{D.bkva, D.bkvb, D.freq, kr, vr, D.cell, D.qpos, 0});
++    dspk::k_attn<<<dim3(NHR, SPLIT), 128, 0, st>>>(dspk::AttnArgs{D.qf, kr, vr, D.cell, D.apart});
++    dspk::k_attn_join<<<NHR, 128, 0, st>>>(D.apart, D.ao);
++    dfl_bfrag(D.ao, QW, Q, D.xb_ao, st);
++    bind::launch(y.wo, st);
++    dfl_put(D, 1 + 2 * j, st);
++}
++// MLP block of layer j (x = its ffn_norm output) up to the publish of collective 2 + 2j
++inline void dfl_mlp(Dfl& D, int j, cudaStream_t st)
++{
++    using namespace dfl;
++    DLayer& y = D.ly[j];
++    dfl_bfrag(D.x, HID, Q, D.xb_x, st);
++    bind::launch(y.w1, st);
++    bind::launch(y.w3, st);
++    dspk::k_swiglu<<<(Q * NIR + 255) / 256, 256, 0, st>>>(D.g, D.u, D.act, Q * NIR);
++    dfl_bfrag(D.act, NIR, Q, D.xb_act, st);
++    bind::launch(y.w2, st);
++    dfl_put(D, 2 + 2 * j, st);
++}
++inline void dfl_consume(Dfl& D, int c, const __nv_bfloat16* w, cudaStream_t st)
++{
++    dfl_wait(D, c, dfl_payload(D, c), st);
++    dspk::k_sum_norm<<<dfl::Q, 256, 0, st>>>(dspk::SumArgs{D.f, D.stepp, c, D.resid, w, D.x, D.eps});
++}
++// row i of the autoregressive head up to the publish of its picks (collective 7 + i)
++inline void dfl_ar(Dfl& D, int i, cudaStream_t st)
++{
++    using namespace dfl;
++    dspk::k_joint<<<1, 256, 0, st>>>(D.state, D.ar_emb, D.x, D.tok, D.sel_tok, i, D.jin);
++    dfl_bfrag(D.jin, JIN, 1, D.xb_jin, st);
++    bind::launch(D.jp, st);
++    dspk::k_rnn<<<1, 256, 0, st>>>(D.jpo, D.jbias, D.state, D.markov, i);
++    dfl_bfrag(D.markov, ST, 1, D.xb_markov, st);
++    bind::launch(D.ar_out, st);
++    const int c = 1 + 2 * L + i;
++    dspk::k_pick<<<1, 1024, 0, st>>>(D.hlog + (size_t)i * D.vn, D.arlog, D.vn, D.vlo, D.f, D.stepp, c, D.tickets + c);
++}
++inline void dfl_in(Dfl& D, cudaStream_t st)
++{
++    dspk::k_in<<<1, 128, 0, st>>>(dspk::InArgs{reinterpret_cast<const uint32_t*>(D.in), D.stepp, D.cell, D.tok, D.qpos});
++}
++// phase p (0..NPH-1). query = false: the context part only (phases 0 and 1, phase 1 without the block)
++inline void dfl_phase(Dfl& D, int p, cudaStream_t st, bool query = true)
++{
++    using namespace dfl;
++    if (p == 0)
++    {
++        dfl_in(D, st);
++        dfl_bfrag(D.feat, NT * HID, CR, D.xb_feat, st);
++        bind::launch(D.tp, st);
++        k_put_publish<<<16, 128, 0, st>>>(reinterpret_cast<const uint4*>(D.tpo), D.f, D.stepp, 0, (int)(dfl_payload(D, 0) / 16), D.tickets);
++        return;
++    }
++    if (p == 1)
++    {
++        dfl_ctx_store(D, 0, st);
++        if (!query) return;
++        dspk::k_block_in<<<Q, 256, 0, st>>>(D.emb, D.tok, D.mask, D.resid);
++        dspk::k_rms<<<Q, 256, 0, st>>>(D.resid, nullptr, HID, HID, D.ly[0].attn_norm, D.eps, D.x, HID, nullptr);
++        dfl_attn(D, 0, st);
++        return;
++    }
++    if (p <= 2 * L)                   // even p = 2 + 2j: layer j's attention partial in, its MLP out; odd p = 3 + 2j: MLP in, layer j + 1 out
++    {
++        const int j = (p - 2) / 2;
++        if (p % 2 == 0)
++        {
++            dfl_consume(D, p - 1, D.ly[j].ffn_norm, st);
++            dfl_mlp(D, j, st);
++        }
++        else
++        {
++            dfl_consume(D, p - 1, D.ly[j + 1].attn_norm, st);
++            dfl_attn(D, j + 1, st);
++        }
++        return;
++    }
++    if (p == 2 * L + 1)               // the last MLP in, final_norm, the target head, the autoregressive row 0
++    {
++        dfl_consume(D, p - 1, D.fnorm, st);
++        bind::launch(D.head.xf_h, st);
++        bind::launch(D.head.lm_head, st);
++        dspk::k_softcap<<<(Q * D.vn + 255) / 256, 256, 0, st>>>(D.hlog, Q * D.vn);
++        dfl_ar(D, 0, st);
++        return;
++    }
++    const int i = p - (2 * L + 1);    // 1 .. Q: row i-1's picks merged; row i's head, or the output
++    const int c = 1 + 2 * L + i - 1;
++    dfl_wait(D, c, sizeof(dspk::Pick), st);
++    dspk::k_pick_merge<<<1, 32, 0, st>>>(D.f, D.stepp, c, D.sel_tok, i - 1);
++    if (i < Q) dfl_ar(D, i, st);
++    else dspk::k_out<<<1, 32, 0, st>>>(D.sel_tok, D.out);
++}
++inline void dfl_step(Dfl& D, cudaStream_t st, bool query = true)
++{
++    for (int p = 0; p < (query ? dfl::NPH : 2); ++p) dfl_phase(D, p, st, query);
++}
++constexpr bool dfl_delivered(int p, bool query) { return p < dfl::NC && (query || p == 0); }
++// a fill step (prompt context from Dfl::pf_feat, B rows): 0 = the NT feature gathers out; 1 = in, tp slices out
++// (collective NT); 2 = the context part
++constexpr int DFL_FILL_PH = 3;
++inline void dfl_fill_phase(Dfl& D, int p, cudaStream_t st)
++{
++    using namespace dfl;
++    if (p == 0)
++    {
++        dfl_in(D, st);
++        for (int s = 0; s < NT; ++s) dspk::k_fill_put<<<1, 128, 0, st>>>(D.pf_feat, D.cell, s, D.f, D.stepp, D.tickets + s);
++        return;
++    }
++    if (p == 1)
++    {
++        for (int s = 0; s < NT; ++s) dfl_wait(D, s, (size_t)B * HID * 2, st);
++        dspk::k_fill_get<<<dim3(HID / 256, B, NT), 256, 0, st>>>(D.f, D.stepp, D.feat);
++        dfl_bfrag(D.feat, NT * HID, CR, D.xb_feat, st);
++        bind::launch(D.tp, st);
++        k_put_publish<<<16, 128, 0, st>>>(reinterpret_cast<const uint4*>(D.tpo), D.f, D.stepp, NT, (int)((size_t)CR * NFR * 4 / 16), D.tickets + NT);
++        return;
++    }
++    dfl_ctx_store(D, NT, st);
++}
++inline void dfl_fill_step(Dfl& D, cudaStream_t st)
++{
++    for (int p = 0; p < DFL_FILL_PH; ++p) dfl_fill_phase(D, p, st);
++}
++inline void dfl_dump_step(FILE* f, const Dfl& D, const DflIn& di, const DflOut* o)
++{
++    if (!f) return;
++    int h[12] = {o ? 1 : 0, di.ctx_pos0, di.ctx_rows, di.q0, di.tok0};
++    for (int r = 1; r < dfl::B; ++r) h[4 + r] = o ? o->tok[r] : -1;
++    fwrite(h, 4, 12, f);
++    std::vector<__half> v((size_t)di.ctx_rows * dfl::NT * HID);
++    G6RT_CK(cudaMemcpy(v.data(), D.feat, v.size() * 2, cudaMemcpyDeviceToHost));
++    fwrite(v.data(), 2, v.size(), f);
++}
++inline void dfl_dump_tokens(FILE* f, const std::vector<int>& t)
++{
++    if (!f) return;
++    int h[12] = {2, (int)t.size()};
++    fwrite(h, 4, 12, f);
++    fwrite(t.data(), 4, t.size(), f);
++    fflush(f);
++}
++
++// ---------------------------------------------------------------- the target side
++inline Dfl*& dfl_of(const Model& m)
++{
++    static Dfl* by_rank[8] = {};
++    return by_rank[m.rank & 7];
++}
++inline void dfl_tap_launch(Model& m, int i, int M, cudaStream_t st)
++{
++    Dfl* D = dfl_of(m);
++    for (int s = 0; s < dfl::NT; ++s)
++        if (D->tlayer[s] == m.layers[i].l) dspk::k_tap<<<dim3(HID / 256, M), 256, 0, st>>>(m.resid, D->feat, s);
++}
++inline void dfl_pf_tap_launch(Model& m, Prefill& P, int i, int M, cudaStream_t st)
++{
++    Dfl* D = dfl_of(m);
++    if (!D->pf_feat || D->pf_hi <= D->pf_lo) return;
++    for (int s = 0; s < dfl::NT; ++s)
++    {
++        if (D->tlayer[s] != m.layers[i].l) continue;
++        const int r0 = P.rs ? pf_r0(M, P.f.rank, P.f.nr) : 0, rows = P.rs ? pf_rows(M, P.f.rank, P.f.nr) : P.f.rank == 0 ? M : 0;
++        if (rows > 0) dspk::k_pf_tap<<<dim3(HID / 256, rows), 256, 0, st>>>(P.resid, P.pos, r0, D->pf_lo, D->pf_hi, D->pf_feat, s);
++    }
++}
++inline void dfl_attach(Model& m, Dfl& D)
++{
++    for (int s = 0; s < dfl::NT; ++s)
++    {
++        bool found = false;
++        for (const Layer& y : m.layers) found |= y.l == D.tlayer[s];
++        if (!found) die("--dflash: target layer " + std::to_string(D.tlayer[s]) + " is not in --layers");
++    }
++    dfl_of(m) = &D;
++    m.dfl_tap = dfl_tap_launch;
++}
++}   // namespace g6rt
+diff --git a/engine/runtime/s2_batch.h b/engine/runtime/s2_batch.h
+index 95d69de..e412df4 100644
+--- a/engine/runtime/s2_batch.h
++++ b/engine/runtime/s2_batch.h
+@@ -152,7 +152,8 @@ struct Stats
+ };
+ // one DFlash2 drafter step of session sess (dflash.cuh DflIn): context = its target rows at positions pos0 .. pos0 + rows - 1,
+ // lo = the lowest position the drafter holds; query: also draft the block after them, bonus token tok0
+-constexpr int DFL_B = g6mod::INFO.dfl_block;   // the bonus row and 7 drafts
++constexpr int DFL_B = 8;   // the planner's ABI (g6sched.h g6s2_dfl_drafts): the bonus row and 7 drafts; a smaller drafter block (ML4's DSpark: g6mod::INFO.dfl_block = 4) fills the first rows
++static_assert(g6mod::INFO.dfl_block <= DFL_B, "the drafter block exceeds the planner's DflDrafts");
+ constexpr int DFL_WIN = 2048, DFL_RING = 4096;   // = dfl::WIN, dfl::RING: the drafter's window and its KV ring (positions)
+ // phase (GR8_DRAFT_PAR): 0 = launch and wait; 1 = launch on the drafter's own stream and return at once; 2 = wait for
+ // that launch and return its drafts
+-- 
+2.43.0
+

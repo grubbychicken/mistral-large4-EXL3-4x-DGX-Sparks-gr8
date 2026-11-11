@@ -1,0 +1,28 @@
+From b035a0d463951d0e73e27f7b30052674fd5afa26 Mon Sep 17 00:00:00 2001
+From: gr8-ml4 <benjamin.j.millar@gmail.com>
+Date: Mon, 9 Nov 2026 21:22:44 +0000
+Subject: [PATCH] ML4 S2: the batched layers get ML4's q_raw / x_ln / attn_c
+ buffers (the first batched step wrote to address 0)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ engine/runtime/s2.cuh | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/engine/runtime/s2.cuh b/engine/runtime/s2.cuh
+index 42d02ac..676553b 100644
+--- a/engine/runtime/s2.cuh
++++ b/engine/runtime/s2.cuh
+@@ -680,6 +680,9 @@ inline const bind::Layer& s2_layer(Model& m, int i, int M)
+     io.attn_part = m.sc.part[0];
+     io.x2 = m.x2; io.logits = m.logits; io.plan = bind::plan_ptrs(m.plan);
+     io.mlp_part = m.sc.part[1];
++#if G6_MODEL_ML4
++    io.q_raw = m.q_raw; io.x_ln = m.x_ln; io.attn_c = m.attn_c;   // ML4's own buffers (layer_base sets them too)
++#endif
+     static const int fuse = (int)knob::fuse();
+     std::unique_ptr<bind::Layer> L(new bind::Layer());
+     if (const char* e = bind::make_layer(y.T, M, m.sc, io, *L, fuse, s.h.cls))
+-- 
+2.43.0
+

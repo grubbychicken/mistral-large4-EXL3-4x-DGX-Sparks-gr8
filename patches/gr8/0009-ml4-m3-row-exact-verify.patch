@@ -1,0 +1,61 @@
+From c790e2e6c2247ccd06646b99277b345f0fee3863 Mon Sep 17 00:00:00 2001
+From: grubbychicken <ben@grbychkn.com>
+Date: Mon, 9 Nov 2026 18:51:49 +0000
+Subject: [PATCH] ML4 M3 D4: row-exact verify (drafted = plain)
+
+bind.cuh make_layer_ml4: every dense trellis GEMV (wq, wo, layer 0 GLU / down) at the k split dtr::split_for picks at
+one row, and the MoE K1 at the 1-row split class (split_m 1 unless S2 gives a session class), at every row count.
+
+Checked: m4sim --minv on the M1 subset, rows at 1, 2, 3 and 4 a step: every row line equal (layer 0 alone was already;
+the MoE layers and the dense splits were not). Full model on the ring, code-edit prompt, 400 greedy tokens: drafted
+(--dflash-k 3, 2.35 accepted a round, 27.96 tok/s) byte-identical to plain (56.0 ms a 1-row step, unchanged).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ engine/kernels/bind.cuh | 21 ++++++++++++++++-----
+ 1 file changed, 16 insertions(+), 5 deletions(-)
+
+diff --git a/engine/kernels/bind.cuh b/engine/kernels/bind.cuh
+index f1856f6..230a663 100644
+--- a/engine/kernels/bind.cuh
++++ b/engine/kernels/bind.cuh
+@@ -1280,8 +1280,15 @@ inline const char* make_layer_ml4(const LayerTensors& T, int M, const Scratch& s
+         return "ML4 attention projection shapes do not chain (wq 6144 -> heads * 128 = wo's input)";
+     if (L.kv_a.on && (L.kv_a.K != HID || L.kv_a.O != geom::KVA)) return "ML4 kv_a.f16.gv is not [576 <- 6144]";
+     L.heads = D.q_b.N / 128;
+-    if ((e = dtr::make_out(D.q_b, M, io.x, HID, nullptr, io.q_raw, D.q_b.N, dtr::O_F16, sc.dt, 0, 0, 1, L.q_b_t))) return e;
+-    if ((e = dtr::make_out(D.o_proj, M, io.attn_c, D.o_proj.K, nullptr, io.attn_part, HID, dtr::O_BF16, sc.dt, 64, 0, 1, L.o_proj_t)))
++    // the k split of every dense trellis GEMV is the one dtr::split_for picks at 1 row, at every row count: a verify step
++    // (2-4 rows) then sums each row in the order a 1-row step does, so drafted decoding equals plain decoding (the recipe's
++    // docs/PORT.md section 9, D4). fill() still widens the split where a wide step's shared memory needs it
++    auto split1 = [](const dtr::Mat& mm, int epi, int rot, int& ks, int& sub) { dtr::split_for(mm.K, mm.side, epi, rot, 1, ks, sub); };
++    int ks = 0, sub = 1;
++    split1(D.q_b, dtr::EPI_OUT, 1, ks, sub);
++    if ((e = dtr::make_out(D.q_b, M, io.x, HID, nullptr, io.q_raw, D.q_b.N, dtr::O_F16, sc.dt, 0, ks, sub, L.q_b_t))) return e;
++    split1(D.o_proj, dtr::EPI_OUT, 1, ks, sub);
++    if ((e = dtr::make_out(D.o_proj, M, io.attn_c, D.o_proj.K, nullptr, io.attn_part, HID, dtr::O_BF16, sc.dt, 64, ks, sub, L.o_proj_t)))
+         return e;
+     L.xf_x.on = 1;  L.xf_x.src = io.x;     L.xf_x.ld = HID;  L.xf_x.K = HID;  L.xf_x.f16 = sc.xf_x;   L.xf_x.bf16 = nullptr;
+     L.xf_qa.on = L.indexer; L.xf_qa.src = io.x_ln; L.xf_qa.ld = HID; L.xf_qa.K = HID; L.xf_qa.f16 = sc.xf_qa; L.xf_qa.bf16 = nullptr;
+@@ -1293,11 +1300,15 @@ inline const char* make_layer_ml4(const LayerTensors& T, int M, const Scratch& s
+         if (L.moe) return "ML4: dense trellis MLP tensors in a MoE layer";
+         if (D.gate.fmt != 1 || D.down.fmt != 1) return "ML4 dense MLP is not K3 mul1 (dtr format 1)";
+         if (D.gate.N > g6nr::DENSE_CH || D.gate.N % 128) return "ML4 dense MLP width is not 128-blocks within DENSE_CH";
+-        if ((e = dtr::make_glu(D.gate, D.up, D.down, M, io.x2, HID, sc.dxd, sc.dt, 128, 0, 1, L.glu_t))) return e;
+-        if ((e = dtr::make_out(D.down, M, nullptr, 0, sc.dxd, io.mlp_part, HID, dtr::O_BF16, sc.dt, 192, 0, 1, L.down_t))) return e;
++        split1(D.gate, dtr::EPI_GLU, 1, ks, sub);
++        if ((e = dtr::make_glu(D.gate, D.up, D.down, M, io.x2, HID, sc.dxd, sc.dt, 128, ks, sub, L.glu_t))) return e;
++        split1(D.down, dtr::EPI_OUT, 0, ks, sub);   // its input: the GLU's fragment tables (rot 0)
++        if ((e = dtr::make_out(D.down, M, nullptr, 0, sc.dxd, io.mlp_part, HID, dtr::O_BF16, sc.dt, 192, ks, sub, L.down_t))) return e;
+         L.xf_x2.on = 0;
+     }
+-    else if ((e = make_k1(T, M, sc, io.x2, sc.xf_x2, io.plan, io.mlp_part, 1, L.k1, L.sh, fuse, split_m))) return e;
++    // the MoE K1 at the 1-row split for any row count (split_m: S2's session class keeps its own), so a verify row's fc1 /
++    // fc2 sums are a 1-row step's (D4)
++    else if ((e = make_k1(T, M, sc, io.x2, sc.xf_x2, io.plan, io.mlp_part, 1, L.k1, L.sh, fuse, split_m ? split_m : 1))) return e;
+     return nullptr;
+ }
+ #endif
+-- 
+2.43.0
+

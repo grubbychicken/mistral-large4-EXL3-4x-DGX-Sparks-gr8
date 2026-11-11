@@ -1,0 +1,120 @@
+From 8a3ba4fd935f2837292ec5941c8089d5463dc52d Mon Sep 17 00:00:00 2001
+From: grubbychicken <ben@grbychkn.com>
+Date: Tue, 10 Nov 2026 10:53:08 +0000
+Subject: [PATCH] ML4 decode: GR8_IDXQ_SPLIT - each rank runs its quarter of
+ the indexer wq_b output tiles (50 MB of fp16 a full-index layer, replicated),
+ gathered while kv_a and wq run (same bits; 4-row verify 108.7 -> 102.1 ms);
+ GR8_DEC_PROF on drafted verify steps
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ engine/runtime/g6m4.cu  | 13 ++++++++++---
+ engine/runtime/m4sim.cu |  1 +
+ engine/runtime/rank.cuh | 24 ++++++++++++++++++++++++
+ 3 files changed, 35 insertions(+), 3 deletions(-)
+
+diff --git a/engine/runtime/g6m4.cu b/engine/runtime/g6m4.cu
+index 8e96810..45dd988 100644
+--- a/engine/runtime/g6m4.cu
++++ b/engine/runtime/g6m4.cu
+@@ -354,12 +354,15 @@ int main(int argc, char** argv)
+     // both (main and draft steps never run at once; inside the shim / front end's taskset range 0..N-8;
+     // GR8_QA_SPLIT_CPU moves it). Every rank must run the same values (the S2 runtime signature carries them).
+     // replicated-GEMV split needs peers to gather across (pointless at TP1); the Flash build plans no gathers
+-    // DS41 builds no QSplit geometry, so the split is off there and a request for it is refused; so does ML4 (no q_a; its
+-    // replicated kv_a / indexer GEMVs are not split yet)
++    // DS41 builds no QSplit geometry, so the split is off there and a request for it is refused. ML4 has no q_a; of its
++    // replicated GEMVs only the indexer's wq_b is split (GR8_IDXQ_SPLIT=1, rank.cuh launch_attn_in_ml4: 50 MB of fp16 on
++    // each of the 44 full-index layers, 2.2 GB a step on every rank), kv_a and the indexer's wk / weights_proj are not
+     const bool qs_def = g6nr::NR > 1 && !G6_MODEL_FLASH && !G6_MODEL_DS41 && !G6_MODEL_ML4;
+     const int qs_mode = (int)knob::qa_split().value_or(qs_def ? 2 : 0);
+     const bool iq_split = knob::idxq_split().value_or(qs_def), mtp_split = knob::mtp_split().value_or(qs_def && mtp);
+-    if ((G6_MODEL_FLASH || G6_MODEL_DS41 || G6_MODEL_ML4) && (qs_mode || iq_split || mtp_split)) die("GR8_QA_SPLIT, GR8_IDXQ_SPLIT and GR8_MTP_SPLIT are GLM-5.3 paths");
++    if ((G6_MODEL_FLASH || G6_MODEL_DS41) && (qs_mode || iq_split || mtp_split)) die("GR8_QA_SPLIT, GR8_IDXQ_SPLIT and GR8_MTP_SPLIT are GLM-5.3 paths");
++    if (G6_MODEL_ML4 && (qs_mode || mtp_split)) die("ML4: GR8_QA_SPLIT and GR8_MTP_SPLIT are GLM-5.3 paths (GR8_IDXQ_SPLIT is the ML4 split)");
++    if (G6_MODEL_ML4 && iq_split && g6nr::NR == 1) die("GR8_IDXQ_SPLIT needs peers to gather across");
+     if (mtp_split && !mtp) die("GR8_MTP_SPLIT=1 needs --mtp");
+     // GR8_S2_DSEL_MODEL=1 + GR8_S2_DSEL_TABLE=<key:value list | file> (s2_batch.h DSelTable; default 0): the drafter
+     // choice prices both drafters from one frozen cost table and MTP rounds under the confidence stop. Every rank reads
+@@ -3411,12 +3414,16 @@ int main(int argc, char** argv)
+             fab_enqueue(si.step, sizes);
+             cp_enqueue(si.step, M, si.context);
+             qs_enqueue(si.step, M);
++            dec_prof().on = knob::dec_prof() && s > 0;      // GR8_DEC_PROF on the drafted path too: verify steps by row count
++            dec_prof().M = M; dec_prof().last = 0;
+             const auto t0 = std::chrono::steady_clock::now();
+             if (graph) launch_main(bucket_of(m, si.context), M);
+             else launch_step(m, M, si.context, st, -1, 0, residual_copy);
+             G6RT_CK(cudaStreamSynchronize(st));
+             const double dt = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+             evprof_read(M, st, R);
++            if (dec_prof().on) ++dec_prof().steps[M];
++            dec_prof().on = false;
+             ms += dt;
+             if (*f.error || cp_error()) { fprintf(stderr, "g6m4: rank %d fabric error word %08x (CP %08x) at seq %zu step %d\n", R, *f.error, cp_error(), q, s); exit(3); }
+             const StepOut so = *out;
+diff --git a/engine/runtime/m4sim.cu b/engine/runtime/m4sim.cu
+index dd0a946..2f00275 100644
+--- a/engine/runtime/m4sim.cu
++++ b/engine/runtime/m4sim.cu
+@@ -401,6 +401,7 @@ int main(int argc, char** argv)
+     const int qs_mode = (int)knob::qa_split().value_or(0);
+     const bool iq_split = knob::idxq_split().value_or(false), mtp_split = knob::mtp_split().value_or(false);
+     if (mtp_split && !mtp) die("GR8_MTP_SPLIT=1 needs --mtp");
++    if (G6_MODEL_ML4 && (qs_mode || iq_split || mtp_split)) die("ML4: the replicated-GEMV splits run in g6m4 only (the ML4 block has no loopback gather phases)");
+     const bool row_lines_on = knob::test_row_lines();
+     std::vector<int> minv_rows;         // --minv: the row counts, in order
+     if (minv >= 0)
+diff --git a/engine/runtime/rank.cuh b/engine/runtime/rank.cuh
+index 070edf3..ce27257 100644
+--- a/engine/runtime/rank.cuh
++++ b/engine/runtime/rank.cuh
+@@ -1682,21 +1682,45 @@ inline void launch_attn_cp(Model& m, int i, int M, int context, int phase, cudaS
+ // layout (ml4::qprep: ssmax, sqrt(2), zero lanes); on indexer layers the LayerNorm query (ml4::ln, wq_b, ml4::ssmax); GLM's
+ // attention core; its output compacted to 128 value dims for wo (dtr).
+ // the block's inputs: kv_a, indexer k / weights, q (qprep), the indexer query; shared by the CP block (launch_attn_cp)
++// GR8_IDXQ_SPLIT=1 on an indexer layer: wq_b is 50 MB of fp16 that every rank holds in full, so each rank runs its own
++// output tiles of it first (qs_narrow: the same bits per tile) and publishes them; kv_a, the indexer's k / weights and wq
++// run while the gather is on the wire; ssmax then takes the gathered rows. noiq: no GEMV, the gather still runs (as
++// launch_qb_idxq: the gather fabric's collectives keep their order and sizes on every rank)
+ inline void launch_attn_in_ml4(Model& m, int i, const Layer& y, const bind::Layer& b, int M, cudaStream_t st, bool noiq)
+ {
+     if (m.qs.mode) die("ML4: GR8_QA_SPLIT is not supported");
++    const int c = m.qs.iq ? m.qs.ciq[i] : -1;
+     dmark(DP_OTHER, st);
+ #ifdef DEC_SLOT
+     if (i == 0) bind::launch(b.xf_x, st);      // later layers: the fragment tables come from launch_consume(2i-1)
+ #else
+     bind::launch(b.xf_x, st);
+ #endif
++    if (c >= 0)
++    {
++        if (!noiq)
++        {
++            ml4::ln(m.x, HID, y.idx_qn, HID, m.x_ln, HID, M, st);
++            bind::launch(b.xf_qa, st);        // fragments of x_ln
++            bind::launch(b.idx_q, st);        // this rank's tiles
++        }
++        qs_put(m, c, M, st);
++        dmark(DP_QB, st);
++    }
+     bind::launch(b.kv_a, st);                 // off on KV-sharing layers
+     bind::launch(b.idx_k, st);
+     bind::launch(b.idx_w, st);
+     dmark(DP_QA, st);
+     bind::launch_q_b(b, st);                  // wq -> m.q_raw
+     ml4::qprep(m.q_raw, m.pos, y.ssmax, y.ab.head_begin, b.heads, geom::rope(y.l) ? 1 : 0, m.q_b, M, st);
++    if (c >= 0)
++    {
++        dmark(DP_QB, st);
++        qs_get(m, c, M, st);
++        if (!noiq) ml4::ssmax(m.idx_q, m.pos, y.idx_ss, geom::IDX_HEADS, geom::IDX_DIM, M, st);
++        dmark(DP_QAG, st);                    // the gather's wait and copy ("q_a gather+norm" in the profile)
++        return;
++    }
+     if (y.indexer && !noiq)
+     {
+         ml4::ln(m.x, HID, y.idx_qn, HID, m.x_ln, HID, M, st);
+-- 
+2.43.0
+

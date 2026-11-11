@@ -1,0 +1,73 @@
+From 3803f8ebbd3520d144c016c35fc25369ab4ded68 Mon Sep 17 00:00:00 2001
+From: gr8-ml4 <benjamin.j.millar@gmail.com>
+Date: Mon, 9 Nov 2026 23:57:14 +0000
+Subject: [PATCH] ML4 prefill: attention in chunks of GR8_PF_ATTN_ROWS rows
+ (the bindings hold that many; same bits, 2048-row sub-batches with 1024-row
+ attention: 3.81 -> 2.60 GB of bindings at 32K)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ engine/runtime/prefill.cuh | 38 +++++++++++++++++++++++++-------------
+ 1 file changed, 25 insertions(+), 13 deletions(-)
+
+diff --git a/engine/runtime/prefill.cuh b/engine/runtime/prefill.cuh
+index 00c8a7f..771af0a 100644
+--- a/engine/runtime/prefill.cuh
++++ b/engine/runtime/prefill.cuh
+@@ -659,10 +659,10 @@ inline void build_prefill(Prefill& P, Model& m, const Find& find, int Mmax, cons
+         }
+     }
+ #if G6_MODEL_ML4
+-    // ML4 (the recipe's docs/PORT.md section 8, X6): GLM's prefill flow with the fp16 GEMM family. Its row-owner, QO, pair
+-    // and tensor-core attention variants and attention chunking are GLM-shaped and refused here
+-    if (P.own || P.ownix || P.qo || P.qp || chunked)
+-        die("ML4 prefill: GR8_PF_OWN and GR8_PF_ATTN_ROWS are GLM-5.3 paths (not ported)");
++    // ML4 (the recipe's docs/PORT.md section 8, X6): GLM's prefill flow with the fp16 GEMM family. Its row-owner, QO and
++    // pair variants are GLM-shaped and refused here. GR8_PF_ATTN_ROWS (attention in chunks, pf_attn_block_ml4) is taken
++    if (P.own || P.ownix || P.qo || P.qp)
++        die("ML4 prefill: GR8_PF_OWN is a GLM-5.3 path (not ported)");
+     P.q_raw = dmalloc<__half>(n * g6nr::HMAX * 128);
+     P.x_ln = dmalloc<__half>(n * HID);
+     P.attn_c = dmalloc<__half>(n * g6nr::HMAX * 128);
+@@ -1327,17 +1327,29 @@ inline void pf_attn_block_ml4(Model& m, Prefill& P, int i, int M, int context, c
+         ml4::ssmax(P.idx_q, P.pos, y.idx_ss, geom::IDX_HEADS, geom::IDX_DIM, M, st);
+     }
+     pf_mark(0, st);
+-    G6AttnStep s{};
+-    s.rows = M; s.context = context;
+-    s.q_b = P.q_b; s.kv_a = P.kv_a; s.positions = P.pos;
+-    if (y.indexer) { s.index_q = P.idx_q; s.index_k = P.idx_k; s.index_weight = P.idx_w; }
+-    else { s.reuse_indices = P.idx_keep ? P.idx_keep : m.layers[y.index_src].ab.args.indices; s.reuse_rows = M; }
+-    if (P.v2) G6RT_CK(g6_attn_bind_prefill_run(P.av[i], &y.ab, &s, st));   // --pfv2: the tensor-core prefill attention
+-    else G6RT_CK(g6_attn_bind_run(&y.ab, &s, st));
+-    if (y.indexer && P.idx_keep)
++    // attention in chunks of P.attn_rows rows (GR8_PF_ATTN_ROWS; one chunk unless it is below the sub-batch, as GLM's
++    // pf_attn_block): chunk k sees the context up to its own last row, its output compacts into its rows of attn_c, and
++    // a chunked lane keeps each indexer chunk's top-k in idx_all for the reuse layers. The bindings hold attn_rows rows
++    const int AR = P.attn_rows;
++    const bool chunked = AR < M;
++    for (int c0 = 0; c0 < M; c0 += AR)
++    {
++        const int r = std::min(AR, M - c0);
++        G6AttnStep s{};
++        s.rows = r; s.context = context - (M - c0 - r);
++        s.q_b = P.q_b + (size_t)c0 * b.heads * 256; s.kv_a = P.kv_a + (size_t)c0 * geom::KVA; s.positions = P.pos + c0;
++        if (y.indexer) { s.index_q = P.idx_q + (size_t)c0 * geom::ML4_IDXQ; s.index_k = P.idx_k + (size_t)c0 * geom::IDX_DIM; s.index_weight = P.idx_w + (size_t)c0 * geom::IDX_HEADS; }
++        else if (P.idx_all && chunked) { s.reuse_indices = P.idx_all + (size_t)c0 * 2048; s.reuse_rows = r; }
++        else { s.reuse_indices = P.idx_keep ? P.idx_keep : m.layers[y.index_src].ab.args.indices; s.reuse_rows = M; }
++        if (P.v2) G6RT_CK(g6_attn_bind_prefill_run(P.av[i], &y.ab, &s, st));   // --pfv2: the tensor-core prefill attention
++        else G6RT_CK(g6_attn_bind_run(&y.ab, &s, st));
++        if (y.indexer && P.idx_all && chunked)
++            G6RT_CK(cudaMemcpyAsync(P.idx_all + (size_t)c0 * 2048, y.ab.args.indices, (size_t)r * 2048 * sizeof(int), cudaMemcpyDeviceToDevice, st));
++        ml4::compact((const __half*)y.ab.args.output, b.heads, P.attn_c + (size_t)c0 * b.heads * 128, r, st);
++    }
++    if (y.indexer && P.idx_keep && !chunked)
+         G6RT_CK(cudaMemcpyAsync(P.idx_keep, y.ab.args.indices, (size_t)M * 2048 * sizeof(int), cudaMemcpyDeviceToDevice, st));
+     pf_mark(y.indexer ? 8 : 1, st);
+-    ml4::compact((const __half*)y.ab.args.output, b.heads, P.attn_c, M, st);
+     bindp::launch(b.o, st, b.rs_o);
+     pf_adump(P, i, "oproj", P.part[0], M, HID * 2, st);
+     pf_mark(2, st);
+-- 
+2.43.0
+

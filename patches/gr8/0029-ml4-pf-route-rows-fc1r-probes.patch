@@ -1,0 +1,474 @@
+From 237986a8a567284965865dc0622a220d7b1b0546 Mon Sep 17 00:00:00 2001
+From: grubbychicken <ben@grbychkn.com>
+Date: Tue, 10 Nov 2026 21:37:18 +0000
+Subject: [PATCH] ML4 prefill fc1 on route rows (ML4_PF_RX, default off):
+ k_pf_rot, k_pf_fc1 RX, k_pf_fc1r tiles; timing probes
+
+Same bits as k_pf_fc1 in both modes; neither is faster on a Spark (the route-row pass is memory-bound, the tile CTA
+runs one per SM). Kept as measured, off by default. ML4_PF_RXP / ML4_PF_PAD are timing probes.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ engine/kernels/bind_prefill.cuh | 334 ++++++++++++++++++++++++++++++--
+ 1 file changed, 321 insertions(+), 13 deletions(-)
+
+diff --git a/engine/kernels/bind_prefill.cuh b/engine/kernels/bind_prefill.cuh
+index da6a762..da7f302 100644
+--- a/engine/kernels/bind_prefill.cuh
++++ b/engine/kernels/bind_prefill.cuh
+@@ -37,6 +37,7 @@
+ // Tensors::fc1_wide = bind::LayerTensors::fc1_wide before make_layer and fc1 reads that order. Same results bit for bit.
+ // The same for tr3.fc2: bind::widen_fc2, Tensors::fc2_wide = bind::LayerTensors::fc2_wide.
+ #pragma once
++#include <cstdlib>
+ #include <cublas_v2.h>
+ #include "bind.cuh"
+ #include "gemm_x.cuh"
+@@ -2081,7 +2082,26 @@ struct Expert
+     int wtc = 0;                      // 1: k_pf_fc2t sums each token's routes itself (the fused combine) and launch_fin does nothing
+     int wt_gmajor = 0;                // 1: k_pf_fc2t's CTAs run group-major (GR8_PF_WT_GMAJOR)
+     int* cnt_tg = nullptr;            // [M][HID / 128] the combine's route counters (zeroed by launch_fc2t)
++#if G6_PF_H16
++    // ML4_PF_RX (ML4's fp16 passes; these layers have a suh row per (expert, matrix), so no per-token k_pf_hx): the fc1
++    // input rotated once per (route, matrix) by k_pf_rot instead of once per (segment, block, matrix) inside fc1
++    __half* rx = nullptr;             // [nroutes][HID] f16(H128(x[rr_row[i]] * suh of (rr_e[i], rmat))): one matrix at a time
++    int rmat = 0;                     // the matrix rx holds and the fc1 launch computes (0 gate, 1 up)
++    int rxk = 0;                      // 1: k_pf_fc1 RX stages rx rows (segments); 2: k_pf_fc1r (weight-major tiles of rx rows)
++#endif
+ };
++// ML4_PF_RX (read once): 0 = fc1 rotates in its CTAs, 1 / 2 = Expert::rxk
++inline int pf_rx_mode()
++{
++    static const int v = getenv("ML4_PF_RX") ? atoi(getenv("ML4_PF_RX")) : 0;
++    return G6_MODEL_ML4 ? v : 0;
++}
++// ML4_PF_RXP (timing probes, wrong values): bit 0 = no k_pf_rot, bit 1 = no fc1 kernel
++inline int pf_rx_probe()
++{
++    static const int v = getenv("ML4_PF_RXP") ? atoi(getenv("ML4_PF_RXP")) : 0;
++    return v;
++}
+ 
+ inline int max_segments(int M) { return (M * TOPK + RS - 1) / RS + NEXP; }
+ constexpr int WM_R = 256;             // rows (routes of one expert) of a k_pf_fc1w tile
+@@ -2543,7 +2563,9 @@ __device__ unsigned g_pf_done;
+ // would, so z1 is byte-equal. sW: TR3W_GROUP bytes per group.
+ // mw = the first tile of the unit's matrix (tr3_unit) when NBL == 1; NBL > 1 computes it from the table width (one
+ // width per expert: k_pf_fc1h refuses tr3.kmix experts).
+-template <int BITS, int G, int EB, int NBL = 1, bool BS = false, bool AOP = false PF_H16P, int CB = TR3_MCG>
++// RX (Expert::rxk = 1): sRow holds route indices and the stage copies their rx rows (k_pf_rot: the bytes the prologue
++// writes back into the stage), so the prologue is skipped.
++template <int BITS, int G, int EB, int NBL = 1, bool BS = false, bool AOP = false PF_H16P, int CB = TR3_MCG, bool RX = false>
+ __device__ __forceinline__ void fc1_body(const Expert& A, const long long* tr, int b, int mat, int r0, int rows, unsigned char* sA,
+                                          unsigned char* sX, unsigned char* sW, const int* sRow PF_PRO_ARG, const uint8_t* mw, int nbg = 1,
+                                          const uint8_t* ga = nullptr)
+@@ -2612,7 +2634,7 @@ __device__ __forceinline__ void fc1_body(const Expert& A, const long long* tr, i
+     const int sofs = sr0 * 256 + swz16(sc, sr0) * 16;
+ #if G6_PF_H16
+     const bool hxs = H16 && BS && A.hx;          // stage the pre-rotated rows (k_pf_hx); the prologue only scales them
+-    const __half* xsrc = hxs ? A.hx : A.x;
++    const __half* xsrc = RX ? A.rx : hxs ? A.hx : A.x;
+ #else
+     const __half* xsrc = A.x;
+ #endif
+@@ -2656,7 +2678,7 @@ __device__ __forceinline__ void fc1_body(const Expert& A, const long long* tr, i
+         const int pr = pr0 + pp * 64;
+         const bool pact = pg < G && pr < rows;
+ #if G6_PF_H16
+-        if (!AOP && PF_PRO && hxs && lead && pg < G && pw * 8 + pp * 64 < rows)      // pre-rotated rows: f16(fp32(hx) * v1b scale of the 128-k block), in place
++        if (!RX && !AOP && PF_PRO && hxs && lead && pg < G && pw * 8 + pp * 64 < rows)      // pre-rotated rows: f16(fp32(hx) * v1b scale of the 128-k block), in place
+         {
+             const int R = (pg << rsh) + pr;
+             const float c = __half2float(A.t_v1b[(brow * 2 + mat) * (HID / 128) + hg * G + pg]);
+@@ -2681,7 +2703,7 @@ __device__ __forceinline__ void fc1_body(const Expert& A, const long long* tr, i
+         }
+         else
+ #endif
+-        if (!AOP && PF_PRO && lead && pg < G && pw * 8 + pp * 64 < rows)            // warp-uniform: block pg, lane = (row pr, k32 step q)
++        if (!RX && !AOP && PF_PRO && lead && pg < G && pw * 8 + pp * 64 < rows)            // warp-uniform: block pg, lane = (row pr, k32 step q)
+         {
+             const int R = (pg << rsh) + pr;
+             const unsigned char* xs = sX + (hg & 1) * FC1_XS + R * 256;
+@@ -3011,7 +3033,8 @@ __global__ void __launch_bounds__(256, PF_AOP_MINB) k_pf_aop(Expert A)
+ 
+ // grid (2 EB = block * 2 + matrix, maxseg), block 256. EB = blocks per expert the scratch and grid are laid out for
+ // (g6nr::EB: 3 = the TP6 packs, 4 = TP4; every expert of the table must have tr[3] <= EB).
+-template <int EB = g6nr::EB, bool K2 = false, bool BS = false, bool AOPK = false PF_H16P, int CB = TR3_MCG>
++// RX: grid (EB, maxseg), the matrix is A.rmat (rx holds one matrix)
++template <int EB = g6nr::EB, bool K2 = false, bool BS = false, bool AOPK = false PF_H16P, int CB = TR3_MCG, bool RX = false>
+ __global__ void __launch_bounds__(256, 2) k_pf_fc1(Expert A)
+ {
+     __shared__ __align__(16) unsigned char sA[4 * MB * REC];
+@@ -3054,14 +3077,18 @@ __global__ void __launch_bounds__(256, 2) k_pf_fc1(Expert A)
+     const int* sg = A.segs + static_cast<size_t>(seg) * 3;
+     const int r0 = sg[1], rows = sg[2];
+     const long long* tr = A.t_tab + static_cast<size_t>(sg[0]) * 6;
++#if G6_PF_H16
++    const int mat = RX ? A.rmat : blockIdx.x / EB, b = RX ? blockIdx.x : blockIdx.x - mat * EB;     // x = mat * EB + b: the EB blocks of one (segment, matrix) are adjacent on x (cluster-able)
++#else
+     const int mat = blockIdx.x / EB, b = blockIdx.x - mat * EB;     // x = mat * EB + b: the EB blocks of one (segment, matrix) are adjacent on x (cluster-able)
++#endif
+     if (b >= static_cast<int>(tr[3])) {
+ #ifdef PF_CLK
+         pf_clk_end(false);
+ #endif
+         return;
+     }
+-    if (threadIdx.x < rows) sRow[threadIdx.x] = A.rr_row[r0 + threadIdx.x];
++    if (threadIdx.x < rows) sRow[threadIdx.x] = RX ? r0 + threadIdx.x : A.rr_row[r0 + threadIdx.x];
+     __syncthreads();
+ #ifdef PF_SKIPPRO
+     const bool pro = b == 0 || (static_cast<int>(tr[5]) + b) % 4 == 0;
+@@ -3094,15 +3121,15 @@ __global__ void __launch_bounds__(256, 2) k_pf_fc1(Expert A)
+ #endif
+     if (rows <= 32)                       // G = 2: two 128-k blocks per group
+     {
+-        if (k == 3) fc1_body<3, 2, EB, 1, BS PF_H16A>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
+-        else if (!K2 || k == 4) fc1_body<4, 2, EB, 1, BS PF_H16A>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
+-        else fc1_body<K2 ? 2 : 4, 2, EB, 1, BS PF_H16A>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
++        if (k == 3) fc1_body<3, 2, EB, 1, BS PF_H16A, RX>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
++        else if (!K2 || k == 4) fc1_body<4, 2, EB, 1, BS PF_H16A, RX>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
++        else fc1_body<K2 ? 2 : 4, 2, EB, 1, BS PF_H16A, RX>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
+     }
+     else
+     {
+-        if (k == 3) fc1_body<3, 1, EB, 1, BS PF_H16A>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
+-        else if (!K2 || k == 4) fc1_body<4, 1, EB, 1, BS PF_H16A>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
+-        else fc1_body<K2 ? 2 : 4, 1, EB, 1, BS PF_H16A>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
++        if (k == 3) fc1_body<3, 1, EB, 1, BS PF_H16A, RX>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
++        else if (!K2 || k == 4) fc1_body<4, 1, EB, 1, BS PF_H16A, RX>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
++        else fc1_body<K2 ? 2 : 4, 1, EB, 1, BS PF_H16A, RX>(A, tr, b, mat, r0, rows, sA, sX, sW, sRow PF_PRO_CALL, mw);
+     }
+ #ifdef PF_CLK
+     pf_clk_end(true);
+@@ -3477,6 +3504,54 @@ __global__ void __launch_bounds__(256) k_pf_hx(Expert A)
+         *reinterpret_cast<uint4*>(o + j * 8) = u;
+     }
+ }
++// rx[i] = f16(H128(x[rr_row[i]] * suh)) of route i for matrix A.rmat, suh = the t_v1 row of (the route's expert, block 0,
++// rmat): the fc1_body prologue's lane code, so rx holds the bytes the prologue writes into the fc1 stage. The blocks of
++// one expert on a rank carry the same suh row (one input rotation per weight matrix; fc1_body's "lead block" premise).
++// warp = (8 routes, 128-k block), lane = (route lane / 4, k32 step lane % 4). grid ceil(ceil(nroutes / 8) * HID / 128 / 8), block 256
++__global__ void __launch_bounds__(256) k_pf_rot(Expert A)
++{
++    constexpr int NB = HID / 128;
++    const int w = (blockIdx.x * 256 + threadIdx.x) >> 5, lane = threadIdx.x & 31;
++    const int rb = w / NB, kb = w - rb * NB, i = rb * 8 + (lane >> 2), q = lane & 3;
++    const int n = A.nroutes;
++    if (rb * 8 >= n) return;                     // warp-uniform
++    const bool on = i < n;
++    const int ii = on ? i : n - 1;
++    const long long* tr = A.t_tab + static_cast<size_t>(A.rr_e[ii]) * 6;
++    const __half* xr = A.x + static_cast<size_t>(A.rr_row[ii]) * A.ldx + kb * 128 + q * 32;
++    const __half* sp = A.t_v1 + (static_cast<size_t>(tr[2]) * 2 + A.rmat) * HID + kb * 128 + q * 32;
++    float v[32];
++    #pragma unroll
++    for (int j = 0; j < 4; ++j)
++    {
++        const uint4 xv = on ? *reinterpret_cast<const uint4*>(xr + j * 8) : make_uint4(0u, 0u, 0u, 0u);
++        const uint4 sv = *reinterpret_cast<const uint4*>(sp + j * 8);
++        const u32 xw[4] = {xv.x, xv.y, xv.z, xv.w}, sw[4] = {sv.x, sv.y, sv.z, sv.w};
++        #pragma unroll
++        for (int e = 0; e < 4; ++e)
++        {
++            const float2 x2 = __half22float2(as_h2(xw[e])), s2 = __half22float2(as_h2(sw[e]));
++            v[j * 8 + e * 2] = __fmul_rn(x2.x, s2.x);
++            v[j * 8 + e * 2 + 1] = __fmul_rn(x2.y, s2.y);
++        }
++    }
++    had128_l32(v, lane);
++    if (!on) return;
++    __half* o = A.rx + static_cast<size_t>(i) * HID + kb * 128 + q * 32;
++    #pragma unroll
++    for (int j = 0; j < 4; ++j)
++    {
++        uint4 u;
++        u.x = pack_h2(v[j * 8], v[j * 8 + 1]); u.y = pack_h2(v[j * 8 + 2], v[j * 8 + 3]);
++        u.z = pack_h2(v[j * 8 + 4], v[j * 8 + 5]); u.w = pack_h2(v[j * 8 + 6], v[j * 8 + 7]);
++        *reinterpret_cast<uint4*>(o + j * 8) = u;
++    }
++}
++inline void launch_rot(const Expert& A, cudaStream_t st)       // per matrix (A.rmat), before its fc1 launch
++{
++    const long long warps = static_cast<long long>((A.nroutes + 7) / 8) * (HID / 128);
++    k_pf_rot<<<static_cast<unsigned>((warps + 7) / 8), 256, 0, st>>>(A);
++}
+ __global__ void __launch_bounds__(256) k_pf_hxq(Expert A);       // PF_Q8, below
+ __global__ void __launch_bounds__(256) k_pf_hxqf(Expert A);      // GR8_PF_HXF, below
+ inline void launch_hx(const Expert& A, cudaStream_t st)     // once per layer, before the shared and the routed fc1
+@@ -4130,6 +4205,201 @@ template <int EB = g6nr::EB, int CB = TR3_MCG> inline void launch_fc1w(const Exp
+     k_pf_fc1w<EB, CB><<<dim3(2 * EB, pass_wtiles(A)), 512, WM_SMEM, st>>>(A);
+ #endif
+ }
++#if G6_MODEL_ML4
++// Weight-major fc1 on route rows (Expert::rxk = 2, ML4_PF_RX=2): k_pf_fc1ws's CTA for layers without block scales whose
++// K3 units are in the wide order (ML4 with --wide). CTA = (wtile = up to WM_R consecutive routes of one expert, block b),
++// matrix A.rmat; 384 threads. A = the tile's rx rows (k_pf_rot: already rotated, read by route index, nothing to scale).
++// Producer warp p (0-3) copies A chunks by cp.async and decodes col tiles 2p, 2p + 1: per 128-k group it holds the lane's
++// 2 x 3 u64 of the wide order (ld_nc64, one group ahead, as fc1_body), per k32 step s it decodes chunks 2s and 2s + 1 of
++// both (the 13 bits before a chunk from lane - 1, decode_m as fc1_body's wide path) into sB slot (kk * 8 + col tile).
++// Consumer warp (wr, wc): cols wc * 32 .. + 31, the row blocks of its half of the tile's ceil(rows / 16) (wr = 0 the first
++// ceil(n / 2), so a short tile keeps all 8 consumer warps busy). Every acc sums the k16 steps in increasing order with
++// fc1_body's H16 fragments: z1 is byte-equal to k_pf_fc1. A weight group is read and decoded once per wtile.
++#ifndef PF_RA_NA
++#define PF_RA_NA 5
++#endif
++constexpr int RA_NA = PF_RA_NA;                // A stages (rx rows come from DRAM: a longer cp.async lookahead than fc1ws; 5 = 96 KB of the Spark's 99 KB of smem per CTA)
++constexpr int RA_LA = RA_NA - WS_NB;           // A cp.async lookahead
++static_assert(RA_LA >= 1, "fc1r rings");
++constexpr int RA_SMEM = RA_NA * WM_SA + WS_NB * WM_SB;
++template <int NMW>
++__device__ __forceinline__ void fc1r_cons(float (&acc)[8][4][4], const unsigned char* sA, const unsigned char* sB, int rb0, int wc, int lane)
++{
++    constexpr int NK = KSH / 2, NT = 384;
++    for (int k = 0; k < NK; ++k)
++    {
++        nb_sync(1 + k % WS_NB, NT);
++        const unsigned char* a = sA + (k % RA_NA) * WM_SA;
++        const unsigned char* bb = sB + (k % WS_NB) * WM_SB;
++        if (NMW > 0)
++        {
++            #pragma unroll
++            for (int kk = 0; kk < 2; ++kk)
++            {
++                const uint4 f0 = *reinterpret_cast<const uint4*>(bb + (kk * 8 + wc * 2) * 512 + lane * 16);
++                const uint4 f1 = *reinterpret_cast<const uint4*>(bb + (kk * 8 + wc * 2 + 1) * 512 + lane * 16);
++                const int ch = 2 * kk + (lane >> 4);
++                auto lda = [&](u32 (&av)[4], int mb) {
++                    const int Rl = (rb0 + mb) * 16 + (lane & 15);
++                    pf_ldsm4(av, a + Rl * 64 + ((ch ^ ((Rl >> 1) & 3)) << 4));
++                };
++                u32 av[2][4];
++                lda(av[0], 0);
++                #pragma unroll
++                for (int mb = 0; mb < NMW; ++mb)
++                {
++                    if (mb + 1 < NMW) lda(av[(mb + 1) & 1], mb + 1);
++                    const u32* q = av[mb & 1];
++                    mma16816(acc[mb][0], q[0], q[1], q[2], q[3], f0.x, f0.y);
++                    mma16816(acc[mb][1], q[0], q[1], q[2], q[3], f0.z, f0.w);
++                    mma16816(acc[mb][2], q[0], q[1], q[2], q[3], f1.x, f1.y);
++                    mma16816(acc[mb][3], q[0], q[1], q[2], q[3], f1.z, f1.w);
++                }
++            }
++        }
++        if (k + WS_NB < NK) nb_arrive(1 + WS_NB + k % WS_NB, NT);
++    }
++}
++template <int EB, int CB>
++__device__ __forceinline__ void fc1r_body(const Expert& A, int b, int mat, int r0, int rows, const uint8_t* mw, unsigned char* sm)
++{
++    constexpr int NK = KSH / 2, NT = 384, NB = HID / 128;
++    unsigned char* sA = sm;
++    unsigned char* sB = sA + RA_NA * WM_SA;
++    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
++    if (warp < 4)
++    {
++        // producer: thread t copies A chunks c = t + 128 i (row c / 4, k chunk c % 4 of the k32 step)
++        u32 gx[8];
++        #pragma unroll
++        for (int i = 0; i < 8; ++i)
++        {
++            const int c = t + 128 * i, R = c >> 2;
++            gx[i] = R < rows ? static_cast<u32>(r0 + R) * static_cast<u32>(HID) + static_cast<u32>((c & 3) * 8) : 0xffffffffu;
++        }
++        auto soff = [&](int i) { const int c = t + 128 * i, R = c >> 2; return R * 64 + (((c & 3) ^ ((R >> 1) & 3)) << 4); };
++        auto stage_a = [&](int k) {
++            unsigned char* a = sA + (k % RA_NA) * WM_SA;
++            #pragma unroll
++            for (int i = 0; i < 8; ++i)
++                if (gx[i] != 0xffffffffu) pf::cp16(a + soff(i), A.rx + (gx[i] + static_cast<u32>(k * 32)));
++        };
++        // the lane's u64 n of col tile 2 warp + jj in group hb: mw + hb * TR3W_GROUP + (n * 8 + tile) * 256 + lane * 8
++        const uint8_t* wg = mw + static_cast<size_t>(2 * warp) * 256 + lane * 8;
++        u64 nw[2][3], cw[2][3];
++        #pragma unroll
++        for (int jj = 0; jj < 2; ++jj)
++            #pragma unroll
++            for (int n = 0; n < 3; ++n) { nw[jj][n] = ld_nc64(wg + jj * 256 + n * 2048); cw[jj][n] = 0; }
++        #pragma unroll
++        for (int k = 0; k < RA_LA; ++k)
++        {
++            stage_a(k);
++            pf::cp_commit();
++        }
++        for (int j = 0; j < NK; ++j)
++        {
++            // consumers done with step j - WS_NB: B stage j % WS_NB and A stage (j + RA_LA) % RA_NA are free
++            if (j >= WS_NB) nb_sync(1 + WS_NB + j % WS_NB, NT);
++            if (j + RA_LA < NK) stage_a(j + RA_LA);
++            pf::cp_commit();
++            pf::cp_wait<RA_LA>();
++            const int s = j & 3, hb = j >> 2;
++            if (s == 0)
++            {
++                #pragma unroll
++                for (int jj = 0; jj < 2; ++jj)
++                    #pragma unroll
++                    for (int n = 0; n < 3; ++n)
++                    {
++                        cw[jj][n] = nw[jj][n];
++                        if (hb + 1 < NB) nw[jj][n] = ld_nc64(wg + static_cast<size_t>(hb + 1) * TR3W_GROUP + jj * 256 + n * 2048);
++                    }
++            }
++            #pragma unroll
++            for (int jj = 0; jj < 2; ++jj)
++                #pragma unroll
++                for (int kk = 0; kk < 2; ++kk)
++                {
++                    const u32 c = trw_chunk<3>(cw[jj], 2 * s + kk);
++                    const u32 pc = __shfl_sync(0xffffffffu, c, (lane + 31) & 31);
++                    u32 f0[2], f1[2];
++                    Tr3Lane<3, false, CB>::decode_m((static_cast<u64>(pc) << 24) | c, 21, f0, f1);
++                    if (A.e4) { f0[0] = pf_e4r(f0[0]); f0[1] = pf_e4r(f0[1]); f1[0] = pf_e4r(f1[0]); f1[1] = pf_e4r(f1[1]); }
++                    *reinterpret_cast<uint4*>(sB + (j % WS_NB) * WM_SB + (kk * 8 + 2 * warp + jj) * 512 + lane * 16) = make_uint4(f0[0], f0[1], f1[0], f1[1]);
++                }
++            nb_arrive(1 + j % WS_NB, NT);
++        }
++        return;
++    }
++    const int cwp = warp - 4, wr = cwp >> 2, wc = cwp & 3;
++    const int nrb = (rows + 15) / 16, h = (nrb + 1) / 2;
++    const int rb0 = wr ? h : 0, nmw = wr ? nrb - h : h;       // the warp's row blocks (warp-uniform)
++    float acc[8][4][4];
++    #pragma unroll
++    for (int mb = 0; mb < 8; ++mb)
++        #pragma unroll
++        for (int n = 0; n < 4; ++n)
++            #pragma unroll
++            for (int i = 0; i < 4; ++i) acc[mb][n][i] = 0.f;
++    switch (nmw)
++    {
++        case 8: fc1r_cons<8>(acc, sA, sB, rb0, wc, lane); break;
++        case 7: fc1r_cons<7>(acc, sA, sB, rb0, wc, lane); break;
++        case 6: fc1r_cons<6>(acc, sA, sB, rb0, wc, lane); break;
++        case 5: fc1r_cons<5>(acc, sA, sB, rb0, wc, lane); break;
++        case 4: fc1r_cons<4>(acc, sA, sB, rb0, wc, lane); break;
++        case 3: fc1r_cons<3>(acc, sA, sB, rb0, wc, lane); break;
++        case 2: fc1r_cons<2>(acc, sA, sB, rb0, wc, lane); break;
++        case 1: fc1r_cons<1>(acc, sA, sB, rb0, wc, lane); break;
++        default: fc1r_cons<0>(acc, sA, sB, rb0, wc, lane); break;
++    }
++    const int c = lane & 3, r = lane >> 2;
++    #pragma unroll
++    for (int mb = 0; mb < 8; ++mb)
++        #pragma unroll
++        for (int n = 0; n < 4; ++n)
++        {
++            if (mb >= nmw) continue;
++            const int col = (wc * 2 + (n >> 1)) * 16 + (n & 1) * 8 + 2 * c, row = (rb0 + mb) * 16 + r;
++            __half* z = A.z1 + (static_cast<size_t>(r0 + row) * (2 * EB) + b * 2 + mat) * 128 + col;
++            if (row < rows) *reinterpret_cast<u32*>(z) = pack_h2(acc[mb][n][0], acc[mb][n][1]);
++            if (row + 8 < rows) *reinterpret_cast<u32*>(z + 8 * (2 * EB) * 128) = pack_h2(acc[mb][n][2], acc[mb][n][3]);
++        }
++}
++// grid (EB, pass_wtiles), block 384, RA_SMEM dynamic smem. K3 wide units only (make_layer_ml4 sets rxk = 2 on such layers).
++template <int EB, int CB = TR3_MCG>
++__global__ void __launch_bounds__(384, 1) k_pf_fc1r(Expert A)
++{
++    extern __shared__ __align__(16) unsigned char ra_sm[];
++    if (static_cast<int>(blockIdx.y) >= *A.n_wt) return;
++    const int* w = A.wt + static_cast<size_t>(blockIdx.y) * 3;
++    const long long* tr = A.t_tab + static_cast<size_t>(w[0]) * 6;
++    const int mat = A.rmat, b = blockIdx.x;
++    if (b >= static_cast<int>(tr[3])) return;
++    size_t off;
++    const int k = tr3_unit(A.t_kmix, w[0], tr, b * 2 + mat, off);
++    if (k != 3) return;
++    fc1r_body<EB, CB>(A, b, mat, w[1], w[2], A.t_fc1 + off, ra_sm);
++}
++template <int EB = g6nr::EB, int CB = TR3_MCG> inline void launch_fc1r(const Expert& A, cudaStream_t st)
++{
++    static bool attr = false;
++    if (!attr)
++    {
++        if (cudaFuncSetAttribute(k_pf_fc1r<EB, CB>, cudaFuncAttributeMaxDynamicSharedMemorySize, RA_SMEM) != cudaSuccess)
++        { fprintf(stderr, "bindp: k_pf_fc1r needs %d bytes of shared memory per CTA\n", RA_SMEM); exit(1); }
++        attr = true;
++    }
++    Expert B = A;
++    for (int m = 0; m < 2; ++m)
++    {
++        B.rmat = m;
++        if (!(pf_rx_probe() & 1)) launch_rot(B, st);
++        if (!(pf_rx_probe() & 2)) k_pf_fc1r<EB, CB><<<dim3(EB, pass_wtiles(A)), 384, RA_SMEM, st>>>(B);
++    }
++}
++#endif
+ #endif
+ 
+ // mid: warp = (route, block): g, u from z1 -> act -> rotated, quantized fc2 input record.
+@@ -5507,10 +5777,40 @@ template <int EB = g6nr::EB> inline void launch_fc1(const Expert& A, cudaStream_
+             return;
+         }
+         if (A.h16 && A.bs && A.hx && A.wm && A.wt) { launch_fc1w<EB, CB>(A, st); return; }        // make_layer: wm only on K4-order units
++#if G6_MODEL_ML4
++        if (A.h16 && !A.bs && A.rx && A.rxk == 2 && A.wt) { launch_fc1r<EB, CB>(A, st); return; }      // ML4_PF_RX=2
++        if (A.h16 && !A.bs && A.rx && A.rxk == 1)      // ML4_PF_RX=1: the rotation once per (route, matrix), then the segment fc1 on rx rows
++        {
++            Expert B = A;
++            for (int m = 0; m < 2; ++m)
++            {
++                B.rmat = m;
++                if (!(pf_rx_probe() & 1)) launch_rot(B, st);
++                static int pad = -1;
++                if (pad < 0)
++                {
++                    pad = getenv("ML4_PF_PAD") ? atoi(getenv("ML4_PF_PAD")) : 0;
++                    if (pad) cudaFuncSetAttribute(k_pf_fc1<EB, false, false, false, true, CB, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, pad);
++                }
++                if (!(pf_rx_probe() & 2)) k_pf_fc1<EB, false, false, false, true, CB, true><<<dim3(EB, A.maxseg), 256, pad, st>>>(B);
++            }
++            return;
++        }
++#endif
+         if (A.h16)
+         {
+             if (A.bs) { if (A.k2) k_pf_fc1<EB, true, true, false, true, CB><<<g, 256, 0, st>>>(A); else k_pf_fc1<EB, false, true, false, true, CB><<<g, 256, 0, st>>>(A); }
+-            else if constexpr (NBS) { if (A.k2) k_pf_fc1<EB, true, false, false, true, CB><<<g, 256, 0, st>>>(A); else k_pf_fc1<EB, false, false, false, true, CB><<<g, 256, 0, st>>>(A); }
++            else if constexpr (NBS) { if (A.k2) k_pf_fc1<EB, true, false, false, true, CB><<<g, 256, 0, st>>>(A); else {
++                static int pad = -1;
++                if (pad < 0)
++                {
++                    pad = getenv("ML4_PF_PAD") ? atoi(getenv("ML4_PF_PAD")) : 0;
++                    cudaDeviceProp dp; int dev = 0; cudaGetDevice(&dev); cudaGetDeviceProperties(&dp, dev);
++                    fprintf(stderr, "ML4_PF dev: SMs %d, smem/SM %zu, smem/block %zu optin %zu, regs/SM %d, threads/SM %d, L2 %d\n", dp.multiProcessorCount,
++                            dp.sharedMemPerMultiprocessor, dp.sharedMemPerBlock, dp.sharedMemPerBlockOptin, dp.regsPerMultiprocessor, dp.maxThreadsPerMultiProcessor, dp.l2CacheSize);
++                    if (pad) fprintf(stderr, "ML4_PF pad %d attr %d\n", pad, (int)cudaFuncSetAttribute(k_pf_fc1<EB, false, false, false, true, CB>, cudaFuncAttributeMaxDynamicSharedMemorySize, pad));
++                }
++                k_pf_fc1<EB, false, false, false, true, CB><<<g, 256, pad, st>>>(A); } }
+             return;
+         }
+ #endif
+@@ -5759,6 +6059,7 @@ struct Scratch
+     __half* hx;                       // [M][HID] Expert::hx
+     uint8_t *hq, *hs;                 // [M][HID], [M][HID / 32] Expert::hq, hs
+     int *wt, *n_wt;                   // Expert::wt, n_wt
++    __half* rx;                       // [R][HID] Expert::rx (ML4_PF_RX; else nullptr)
+ #endif
+     int *wtiles, *n_wtiles, *rr_wp;   // Expert::wtiles, n_wtiles, rr_wp (GR8_PF_WT)
+     uint8_t *hq8, *hs8;               // Expert::hq8, hs8
+@@ -5829,6 +6130,7 @@ inline size_t scratch_layout(Scratch* s, char* base, int M, int eb = g6nr::EB)
+     t.hs = q8 ? reinterpret_cast<uint8_t*>(take(m * (HID / 32))) : nullptr;
+     t.wt = reinterpret_cast<int*>(take((static_cast<size_t>(max_wtiles(M)) + (m + WM_R - 1) / WM_R) * 3 * 4));
+     t.n_wt = reinterpret_cast<int*>(take(4));
++    t.rx = pf_rx_mode() ? reinterpret_cast<__half*>(take(R * HID * 2)) : nullptr;
+ #endif
+ #ifdef PF_AOP
+     t.aop = reinterpret_cast<uint8_t*>(take(ms * AOP_NS * 2 * AOPS));
+@@ -6465,6 +6767,12 @@ inline const char* make_layer_ml4(const bind::LayerTensors& T, const Ml4W& W, in
+     A.z1 = sc.z1; A.x2 = sc.x2; A.yw = sc.yw; A.out = io.mlp_part;
+     A.ysh = sc.yw + static_cast<size_t>(M) * TOPK * HID;   // the shared routes' rows: route M * TOPK + row
+     A.sh_svh = nullptr;               // the shared row's svh is applied by fc2 as for every routed row (tr3.v3 row 128)
++    if (sc.rx)       // ML4_PF_RX: 2 = the weight-major tiles (K3 units in the wide order only), else 1 = the segment fc1 on rx rows
++    {
++        A.rx = sc.rx;
++        A.rxk = pf_rx_mode() == 2 && T.fc1_wide && T.k3 && !T.k2 ? 2 : 1;      // (the kernel takes units of width 3: ML4 packs have no others)
++        if (A.rxk == 2) { A.wt = sc.wt; A.n_wt = sc.n_wt; }
++    }
+     return nullptr;
+ }
+ #endif
+-- 
+2.43.0
+

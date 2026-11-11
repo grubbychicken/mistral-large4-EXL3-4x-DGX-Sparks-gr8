@@ -1,0 +1,61 @@
+From 02fbb9f78e7627e1909ab337a4ae766735870a76 Mon Sep 17 00:00:00 2001
+From: grubbychicken <ben@grbychkn.com>
+Date: Mon, 9 Nov 2026 17:03:51 +0000
+Subject: [PATCH] ML4 M2 X7: the tensor-core prefill attention (--pfv2) on the
+ ML4 cache row
+
+- attn/prefill.cuh expand: ML4 reads the f16ml4 row through the core accessors (latent, rope_key: FP16, ROPE_OFF 1024)
+- runtime/prefill.cuh: --pfv2 allowed for ML4; pf_attn_block_ml4 runs g6_attn_bind_prefill_run when it is on
+
+Checked: m4sim subset prefixes with --pfv2 match the fp32 reference (|lp - ref| mean 0.0044, argmax 16/16). Full model
+on the ring, 2,559-token prompt, --pfv2 --pf-lanes 2 --prefill 1280: 726 tok/s warm (640 cold), attention 0.85 s
+of 6.3 s (was 14.5 s with the generic kernels); greedy tokens equal to the generic-attention run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ engine/attn/prefill.cuh    | 3 +++
+ engine/runtime/prefill.cuh | 7 ++++---
+ 2 files changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/engine/attn/prefill.cuh b/engine/attn/prefill.cuh
+index 6cbfc4b..9dd6b35 100644
+--- a/engine/attn/prefill.cuh
++++ b/engine/attn/prefill.cuh
+@@ -47,6 +47,9 @@ __global__ void expand(G6Attn fixed,half* cache,half* ikey,float* scales,int cou
+      for(int k=0;k<16;k++){half h=__float2half_rn(x[k]*ga::HSCALE);if(!isfinite(__half2float(h)))ga::error(a,4);cache[(int64_t)pos*576+lane+32*k]=h;}}
+     for(int d=512+lane;d<576;d+=32){float x=v?__bfloat162float(((const bf16*)(v+g6kv::ROPE_OFF))[d-512]):0;
+         half h=__float2half_rn(x);if(!isfinite(__half2float(h)))ga::error(a,4);cache[(int64_t)pos*576+d]=h;}
++#elif G6_MODEL_ML4   // the FP16 row (kvfmt.h f16ml4): latent and rope key through the core's accessors
++    for(int d=lane;d<576;d+=32){float x=v?(d<512?ga::latent(v,d):ga::rope_key(v,d-512)):0;
++        half h=__float2half_rn(x);if(!isfinite(__half2float(h)))ga::error(a,4);cache[(int64_t)pos*576+d]=h;}
+ #else
+     for(int d=lane;d<576;d+=32){float x=v?(d<512?ga::latent(v,d):__bfloat162float(((const bf16*)(v+528))[d-512])):0;
+         half h=__float2half_rn(x);if(!isfinite(__half2float(h)))ga::error(a,4);cache[(int64_t)pos*576+d]=h;}
+diff --git a/engine/runtime/prefill.cuh b/engine/runtime/prefill.cuh
+index 394c8c4..e2a23c5 100644
+--- a/engine/runtime/prefill.cuh
++++ b/engine/runtime/prefill.cuh
+@@ -660,8 +660,8 @@ inline void build_prefill(Prefill& P, Model& m, const Find& find, int Mmax, cons
+ #if G6_MODEL_ML4
+     // ML4 (the recipe's docs/PORT.md section 8, X6): GLM's prefill flow with the fp16 GEMM family. Its row-owner, QO, pair
+     // and tensor-core attention variants and attention chunking are GLM-shaped and refused here
+-    if (P.own || P.ownix || P.qo || P.qp || (share ? share->v2 : P.v2) || chunked)
+-        die("ML4 prefill: GR8_PF_OWN, --pfv2 and GR8_PF_ATTN_ROWS are GLM-5.3 paths (not ported)");
++    if (P.own || P.ownix || P.qo || P.qp || chunked)
++        die("ML4 prefill: GR8_PF_OWN and GR8_PF_ATTN_ROWS are GLM-5.3 paths (not ported)");
+     P.q_raw = dmalloc<__half>(n * g6nr::HMAX * 128);
+     P.x_ln = dmalloc<__half>(n * HID);
+     P.attn_c = dmalloc<__half>(n * g6nr::HMAX * 128);
+@@ -1329,7 +1329,8 @@ inline void pf_attn_block_ml4(Model& m, Prefill& P, int i, int M, int context, c
+     s.q_b = P.q_b; s.kv_a = P.kv_a; s.positions = P.pos;
+     if (y.indexer) { s.index_q = P.idx_q; s.index_k = P.idx_k; s.index_weight = P.idx_w; }
+     else { s.reuse_indices = P.idx_keep ? P.idx_keep : m.layers[y.index_src].ab.args.indices; s.reuse_rows = M; }
+-    G6RT_CK(g6_attn_bind_run(&y.ab, &s, st));
++    if (P.v2) G6RT_CK(g6_attn_bind_prefill_run(P.av[i], &y.ab, &s, st));   // --pfv2: the tensor-core prefill attention
++    else G6RT_CK(g6_attn_bind_run(&y.ab, &s, st));
+     if (y.indexer && P.idx_keep)
+         G6RT_CK(cudaMemcpyAsync(P.idx_keep, y.ab.args.indices, (size_t)M * 2048 * sizeof(int), cudaMemcpyDeviceToDevice, st));
+     pf_mark(y.indexer ? 8 : 1, st);
+-- 
+2.43.0
+

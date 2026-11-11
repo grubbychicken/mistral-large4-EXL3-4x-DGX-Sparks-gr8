@@ -1,0 +1,6 @@
+# Never committed: your settings and everything that a run makes.
+config.env
+.env
+.state/
+logs/
+__pycache__/

@@ -1,0 +1,124 @@
+ M engine/attn/attn.cu
+ M engine/attn/decode-small.cuh
+ M engine/attn/kvfmt.h
+ M engine/attn/ml4-decode.cuh
+fc73f43 ML4_KV8: build switch for ML4 on the FP8 KV row (test; default off = the FP16 row, same bits)
+From fc73f435ff953de80c407684430700dee3cbb978 Mon Sep 17 00:00:00 2001
+From: grubbychicken <ben@grbychkn.com>
+Date: Tue, 10 Nov 2026 18:29:20 +0000
+Subject: [PATCH] ML4_KV8: build switch for ML4 on the FP8 KV row (test;
+ default off = the FP16 row, same bits)
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ engine/attn/attn.cu          | 8 ++++----
+ engine/attn/decode-small.cuh | 4 ++--
+ engine/attn/kvfmt.h          | 9 ++++++++-
+ engine/attn/ml4-decode.cuh   | 2 +-
+ 4 files changed, 15 insertions(+), 8 deletions(-)
+
+diff --git a/engine/attn/attn.cu b/engine/attn/attn.cu
+index 4c7a955..700e618 100644
+--- a/engine/attn/attn.cu
++++ b/engine/attn/attn.cu
+@@ -261,7 +261,7 @@ __global__ void fwht_rows(float* p,int rows){
+     for(int k=0;k<16;k++)r[lane+32*k]=x[k]*HSCALE;
+ }
+ #define KV4_ROTATE(p,rows,st) do{if((rows)>0)ga::fwht_rows<<<((rows)+7)/8,256,0,(st)>>>((p),(rows));}while(0)
+-#elif G6_MODEL_ML4
++#elif G6_ML4_F16ROW
+ __device__ float latent(const uint8_t* v,int d){return __half2float(((const half*)v)[d]);}
+ #define KV4_ROTATE(p,rows,st) do{}while(0)
+ #else
+@@ -269,7 +269,7 @@ __device__ float latent(const uint8_t* v,int d){return e4(v[d])*((const float*)(
+ #define KV4_ROTATE(p,rows,st) do{}while(0)
+ #endif
+ // the rope key of a cache row: BF16 on GLM, FP16 on ML4 (kvfmt.h)
+-#if G6_MODEL_ML4
++#if G6_ML4_F16ROW
+ __device__ __forceinline__ float rope_key(const uint8_t* v,int d){return __half2float(((const half*)(v+g6kv::ROPE_OFF))[d]);}
+ __device__ __forceinline__ void rope_put(uint8_t* v,int d,float x){((half*)(v+g6kv::ROPE_OFF))[d]=__float2half_rn(x);}
+ #else
+@@ -309,7 +309,7 @@ __device__ __forceinline__ void append_kv_row(Input input,int row){
+         if(l==0)((half*)(dst+g6kv::SCALE_OFF))[g]=s;}}
+     __syncthreads();
+     dst[t]=(uint8_t)(code[2*t]|(code[2*t+1]<<4));
+-#elif G6_MODEL_ML4
++#elif G6_ML4_F16ROW
+     uint8_t* dst=(uint8_t*)a.mla_cache+((int64_t)pg*a.page_size+pos%a.page_size)*KV_BYTES;
+     for(int d=t;d<512;d+=256){if(!isfinite(v[d]))error(a,4);((half*)dst)[d]=__float2half_rn(v[d]);}
+ #else
+@@ -488,7 +488,7 @@ __global__ void context_parts(Input input,int start,const float* probs,float* pa
+     const float prob=p[slot];const uint8_t* src=nullptr;
+     if(id>=0&&id<=a.positions[r]&&prob!=0)src=kv_at(a,id);
+     rows[t]=(uintptr_t)src;probability[t]=prob;
+-#if G6_KV4 || G6_MODEL_ML4
++#if G6_KV4 || G6_ML4_F16ROW
+     __syncthreads();
+     #pragma unroll 4
+     for(int j=0;j<TOP/PART;j++){
+diff --git a/engine/attn/decode-small.cuh b/engine/attn/decode-small.cuh
+index bb30fe4..b3e906f 100644
+--- a/engine/attn/decode-small.cuh
++++ b/engine/attn/decode-small.cuh
+@@ -631,7 +631,7 @@ static void launch_context_tile(const G6Attn& a,Input input,Work& w,int start,in
+ // index and contexts past 2048 included.
+ template<class Input>   // qt: run_body only (attn.cu use_qt, which implies the scores_sc branch below)
+ static void launch_mla_scores(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st,bool qt=false){
+- #if G6_MODEL_ML4   // the FP16 ML4 row (kvfmt.h): its head-batched kernel (ml4-decode.cuh), or the generic one; the FP8 variants below read E4M3
++ #if G6_ML4_F16ROW   // the FP16 ML4 row (kvfmt.h): its head-batched kernel (ml4-decode.cuh), or the generic one; the FP8 variants below read E4M3
+  (void)qt;
+  if(attn_heads()){constexpr int HG=16;ml4dec::scores_heads<HG><<<dim3(TOP/8,(a.heads+HG-1)/HG,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);}
+  else mla_scores<<<dim3(TOP/8,a.heads,n),256,0,st>>>(input,start,w.q,w.rope,w.prob);
+@@ -653,7 +653,7 @@ static void launch_mla_scores(const G6Attn& a,Input input,Work& w,int start,int
+ // sp (run_body, ctx_sp): context_pk3's slots per partition; 256 = PART partitions (every other caller)
+ template<class Input>
+ static void launch_context_parts(const G6Attn& a,Input input,Work& w,int start,int n,cudaStream_t st,int sp=256){
+- #if G6_MODEL_ML4   // the FP16 ML4 row: its head-batched kernel (ml4-decode.cuh; head group as the FP8 path: 4 up to 4 rows, then 8; GR8_ATTN_CTX3_HG forces 2 / 4 / 8), or the generic one
++ #if G6_ML4_F16ROW   // the FP16 ML4 row: its head-batched kernel (ml4-decode.cuh; head group as the FP8 path: 4 up to 4 rows, then 8; GR8_ATTN_CTX3_HG forces 2 / 4 / 8), or the generic one
+  (void)sp;
+  if(!attn_heads())context_parts<<<dim3(PART,a.heads,n),256,0,st>>>(input,start,w.prob,w.parts);
+  else switch(attn_ctx3_hg()?attn_ctx3_hg():n>=5?8:4){
+diff --git a/engine/attn/kvfmt.h b/engine/attn/kvfmt.h
+index 8da208e..663d41d 100644
+--- a/engine/attn/kvfmt.h
++++ b/engine/attn/kvfmt.h
+@@ -9,6 +9,11 @@
+ //             rotates each key back when it builds its FP16 key table. See docs/KV4.md.
+ // Index key row (22 full-index caches), unchanged by G6_KV4: per 64-row page, 64 x 128 E4M3 codes, then 64 FP32 scales.
+ #pragma once
++#if G6_MODEL_ML4 && !(defined(ML4_KV8) && ML4_KV8)
++#define G6_ML4_F16ROW 1        // ML4's FP16 latent row (the default); 0: GLM's FP8 row (-DML4_KV8=1) or another model
++#else
++#define G6_ML4_F16ROW 0
++#endif
+ #include "../model_geom.h"
+ #ifndef G6_KV4
+ #define G6_KV4 0
+@@ -70,7 +75,9 @@ constexpr int IDX_ROW = IDX_PAGE / PAGE;                    // 128 per token (si
+ constexpr int RAW_RING = 64, RAW_SESS = 8;                  // the raw ring: positions a session, sessions (S2N)
+ constexpr int RAW_BYTES = RAW_SESS * RAW_RING * IDX_RAW;    // 256 KB a binding
+ constexpr int SEL = 2304;   // selected positions per row: TOP_POOLS * KPOOL + the tail (<= 3), padded to 9 x 256
+-#elif G6_MODEL_ML4
++#elif G6_MODEL_ML4 && !(defined(ML4_KV8) && ML4_KV8)
++// -DML4_KV8=1 (a test build, the recipe's docs/PREFILL2.md A7): ML4 on GLM's FP8 row below instead (E4M3 latent with a
++// scale per 128 dims, BF16 rope key), read by GLM's FP8 kernels.
+ // Mistral Large 4 (GLM's attention core, the recipe's docs/PORT.md): [512 FP16 latent][64 FP16 rope] = 1152 B, the
+ // baseline's precision (an E4M3 latent puts attention outputs ~1e-2 off the reference). No scales (SCALE_OFF unused).
+ #if G6_KV4
+diff --git a/engine/attn/ml4-decode.cuh b/engine/attn/ml4-decode.cuh
+index 6732837..ec964e1 100644
+--- a/engine/attn/ml4-decode.cuh
++++ b/engine/attn/ml4-decode.cuh
+@@ -5,7 +5,7 @@
+ // (row, head, slot) output keeps the generic kernels' arithmetic: the same products, the same fmaf order (dims
+ // lane, lane + 32, ..; slots ascending within a partition), the same warp_sum, the same skip of dead slots and of
+ // p == 0, so the outputs are bit-identical.
+-#if G6_MODEL_ML4
++#if G6_ML4_F16ROW
+ namespace ml4dec {
+ using ga::half;
+ // warp per (slot, row), heads [y*HG, y*HG + HG): lane l reads latent dims l + 32k and the rope elements l, l + 32;
+-- 
+2.43.0
+

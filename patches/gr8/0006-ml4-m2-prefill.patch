@@ -1,0 +1,1089 @@
+From 6550fc6b3551cdadd876c71ac7b4a3a9993dba92 Mon Sep 17 00:00:00 2001
+From: grubbychicken <ben@grbychkn.com>
+Date: Mon, 9 Nov 2026 16:13:57 +0000
+Subject: [PATCH 1/2] ML4 M2 X6 P1: fp16 prefill trellis GEMM for K3 mul1
+ (k_gemm_tr_h16 format 1)
+
+- bind_prefill.cuh: G6_PF_H16 (Flash or ML4) for the fp16 GEMM family (Xq::h16, shx_store_h16, k_gemm_tr_h16 with
+  its fp32 rotation epilogue, the h16 mid pass); k_gemm_tr_h16 / GTH16 templated on the dtr format (0: K4 E4M3 mcg,
+  1: K3 mul1, 96-byte tiles, shared memory >= the epilogue staging); Gemm::fmt (ML4 builds only); make_gemm_tr binds
+  ML4 matrices as h16 format 1
+- dtr_ml4_test / dtr_ml4_ref.py: the prefill GEMM over DTR_R rows (NAME.gemm.bin) checked against ExLlamaV3
+
+Checked: wq / wo / layer-0 gate, up, down at 200 rows rel 2.8-3.0e-4 vs fp32 x @ W_eff (fp16 output); GLM and
+GLM-Flash dtr_test SASS identical to HEAD.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ engine/kernels/bind_prefill.cuh      | 77 ++++++++++++++++++----------
+ engine/kernels/tests/dtr_ml4_test.cu | 22 +++++++-
+ engine/ref/dtr_ml4_ref.py            |  9 +++-
+ 3 files changed, 79 insertions(+), 29 deletions(-)
+
+diff --git a/engine/kernels/bind_prefill.cuh b/engine/kernels/bind_prefill.cuh
+index aafda87..c5d857e 100644
+--- a/engine/kernels/bind_prefill.cuh
++++ b/engine/kernels/bind_prefill.cuh
+@@ -41,6 +41,9 @@
+ #include "bind.cuh"
+ #include "gemm_x.cuh"
+ #include "../knobs-rs/gr8_knobs.h"
++// the fp16 prefill GEMM family (Xq::h16 A-fragments, k_gemm_tr_h16, the h16 dense MLP mid pass): GLM-5.3-Flash, and
++// Mistral Large 4 (its dense trellis matrices are K3 mul1 without E4M3: no exact FP8 copy, recipe docs/PORT.md M2 X6)
++#define G6_PF_H16 (G6_MODEL_FLASH || G6_MODEL_ML4)
+ 
+ namespace bindp
+ {
+@@ -234,7 +237,7 @@ struct Xq
+     int ld = 0, K = 0, M = 0;
+     uint8_t* dst = nullptr;
+     const __half* suh = nullptr;      // dense trellis input (dtr.cuh): records of H128(src * suh) per 128 block (k_xq8_rot)
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+     int h16 = 0;                      // 1: dst holds FP16 m16n8k16 A-fragments [ceil(M/16)][K/16][512B] (shx_store_h16)
+ #endif
+ };
+@@ -328,7 +331,7 @@ __global__ void __launch_bounds__(256) k_xq8(Xq a)
+ // Xq::suh: x [M][ld] -> the k_xq8 records of H128(x * suh), quantized from fp32 (the rule of k_shx_rotq).
+ // grid ceil(ceil(M/16)*16 * K/128 / 8), block 256: warp = (row, 128 block)
+ __device__ __forceinline__ void shx_store_mx8(const float (&v)[4], int lane, int row, int M, int S, int s, uint8_t* x8);
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+ __device__ __forceinline__ void shx_store_h16(const float (&v)[4], int lane, int row, int M, int K16, int ks_base, uint8_t* x8);
+ #endif
+ __global__ void __launch_bounds__(256) k_xq8_rot(Xq a)
+@@ -347,7 +350,7 @@ __global__ void __launch_bounds__(256) k_xq8_rot(Xq a)
+         v[0] = __fmul_rn(x01.x, s01.x); v[1] = __fmul_rn(x01.y, s01.y); v[2] = __fmul_rn(x23.x, s23.x); v[3] = __fmul_rn(x23.y, s23.y);
+     }
+     had128(v, lane);
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+     if (a.h16) { shx_store_h16(v, lane, row, a.M, a.K / 16, blk * 8, a.dst); return; }
+ #endif
+     shx_store_mx8(v, lane, row, a.M, a.K / 32, blk * 4 + (lane >> 3), a.dst);
+@@ -415,8 +418,11 @@ struct Gemm
+     long long tsB = 0, tsG = 0;
+     int rgrp = 0;                     // k_gemm_mx8f full-M launches: > 1 = grouped raster of rgrp row blocks (PF_GEMMRF;
+                                       // launch sets it from GR8_PF_GEMMG when 0). Launch order only: the same bits.
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+     int h16 = 0;                      // 1: k_gemm_tr_h16 (fp16 m16n8k16 on shx_store_h16 A-fragments + Tr3Lane<4, true> B)
++#if G6_MODEL_ML4
++    int fmt = 0;                      // h16: the dense trellis format (dtr.cuh Mat::fmt; 1 = ML4's K3 mul1, 96-byte tiles)
++#endif
+ #endif
+ };
+ 
+@@ -1287,7 +1293,7 @@ template <int BM> struct GT
+     static constexpr int A = G2_KS * BM * REC, RAW = 32 * 128, STG = A + RAW, B = 128 * G2_KS * 32;
+     static constexpr int ST = BM == 16 ? 4 : 3, SMEM = ST * STG + 2 * B;     // BM = 16: 98.3 KB, 1 CTA per SM
+ };
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+ template <int BM, bool RS, bool F32 = false> __global__ void __launch_bounds__(GT<BM>::NTH) k_gemm_tr(Gemm g, RsOut rs)
+ #else
+ template <int BM, bool RS> __global__ void __launch_bounds__(GT<BM>::NTH) k_gemm_tr(Gemm g, RsOut rs)
+@@ -1405,7 +1411,7 @@ template <int BM, bool RS> __global__ void __launch_bounds__(GT<BM>::NTH) k_gemm
+     if (g.osvh)
+     {
+         gemm_rot_store<BM, NT, T::NW>(acc, sm, g.osvh, c0, rb0, nb, g.M, wm, colw, [&](int row, int col, const float (&v)[4]) {
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+             if constexpr (F32) *reinterpret_cast<float4*>(static_cast<float*>(g.y) + static_cast<size_t>(row) * g.ldy + col) = make_float4(v[0], v[1], v[2], v[3]);
+             else
+ #endif
+@@ -1423,7 +1429,7 @@ template <int BM, bool RS> __global__ void __launch_bounds__(GT<BM>::NTH) k_gemm
+             const int m = wm * 4 + mb;
+             if (m >= nb) continue;
+             const int col = c0 + colw + nt * 8 + 2 * c, row = (rb0 + m) * 16 + r;
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+             if constexpr (F32)
+             {
+                 float* yf = static_cast<float*>(g.y);
+@@ -1443,7 +1449,7 @@ template <int BM, bool RS> __global__ void __launch_bounds__(GT<BM>::NTH) k_gemm
+ #endif
+         }
+ }
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+ // Pure-fp32 rotation epilogue for k_gemm_tr_h16: stages 64-row passes in sm (64 * 136 * 4 = 34.8 KB <= GTH16<4>::SMEM)
+ // so H128 runs in fp32 before multiplying by svh, matching dtr::k_dtr / kda::k_kda_tr in decode.
+ template <int BM, int NT, int NW, class St>
+@@ -1490,18 +1496,22 @@ __device__ __forceinline__ void gemm_rot_store_f32(const float (&acc)[4][NT][4],
+     }
+ }
+ 
+-template <int BM> struct GTH16
++template <int BM, int F = 0> struct GTH16
+ {
+     static constexpr int WM = BM / 4, WN = BM >= 8 ? 4 : 8, NW = WM * WN, NTH = 32 * NW;
+     static constexpr int WC = 128 / WN, NT = WC / 8;
+-    static constexpr int A = 4 * BM * 512, RAW = 32 * 128, STG = A + RAW;
+-    static constexpr int ST = BM == 16 ? 2 : 3, SMEM = ST * STG;
++    static constexpr int TB = 32 * dtr::fbits(F), CPT = TB / 16;   // tile bytes (K4: 128, ML4 K3: 96), 16-B chunks per tile
++    static constexpr int A = 4 * BM * 512, RAW = 32 * TB, STG = A + RAW;
++    static constexpr int ST = BM == 16 ? 2 : 3, SMEM0 = ST * STG;
++    // gemm_rot_store_f32 stages 64 x 136 fp32 in the same memory (34,816 B); K4 tiles always cover it
++    static constexpr int SMEM = F == 0 || SMEM0 >= 64 * 136 * 4 ? SMEM0 : 64 * 136 * 4;
+ };
+ 
+-template <int BM, bool RS = false, bool F32 = false>
+-__global__ void __launch_bounds__(GTH16<BM>::NTH) k_gemm_tr_h16(Gemm g, RsOut rs = RsOut())
++// F: the dense trellis format (dtr.cuh): 0 = K4 E4M3 mcg (Flash), 1 = K3 mul1 without E4M3 (ML4)
++template <int BM, bool RS = false, bool F32 = false, int F = 0>
++__global__ void __launch_bounds__(GTH16<BM, F>::NTH) k_gemm_tr_h16(Gemm g, RsOut rs = RsOut())
+ {
+-    using C = GTH16<BM>;
++    using C = GTH16<BM, F>;
+     constexpr int NT = C::NT;
+     extern __shared__ __align__(16) unsigned char sm[];
+     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+@@ -1511,7 +1521,7 @@ __global__ void __launch_bounds__(GTH16<BM>::NTH) k_gemm_tr_h16(Gemm g, RsOut rs
+     const int nb = min(BM, RB - rb0), colw = wn * C::WC;
+     const bool full = nb == BM;
+ 
+-    Tr3Lane<4, true> tl;
++    Tr3Lane<dtr::fbits(F), F == 0, F == 1 ? TR3_MUL1 : TR3_MCG> tl;
+     tl.init(lane);
+ 
+     auto loadAB = [&](int slot, int kb)
+@@ -1523,11 +1533,11 @@ __global__ void __launch_bounds__(GTH16<BM>::NTH) k_gemm_tr_h16(Gemm g, RsOut rs
+             if (mb < nb && kb * 4 + j < K16)
+                 pf::cp16(a + c * 16, g.x8 + (static_cast<size_t>(rb0 + mb) * K16 + kb * 4 + j) * 512 + ch * 16);
+         }
+-        for (int c = t; c < 256; c += C::NTH)
++        for (int c = t; c < 32 * C::CPT; c += C::NTH)
+         {
+-            const int ti = c >> 3, ks = kb * 4 + (ti >> 3);
++            const int ti = C::CPT == 8 ? c >> 3 : c / C::CPT, ch = C::CPT == 8 ? c & 7 : c % C::CPT, ks = kb * 4 + (ti >> 3);
+             if (ks < K16)
+-                pf::cp16(a + C::A + c * 16, g.tw + blockIdx.x * g.tsB + (ks >> 3) * g.tsG + ((ks & 7) * 8 + (ti & 7)) * 128 + (c & 7) * 16);
++                pf::cp16(a + C::A + c * 16, g.tw + blockIdx.x * g.tsB + (ks >> 3) * g.tsG + ((ks & 7) * 8 + (ti & 7)) * C::TB + ch * 16);
+         }
+     };
+ 
+@@ -1562,7 +1572,7 @@ __global__ void __launch_bounds__(GTH16<BM>::NTH) k_gemm_tr_h16(Gemm g, RsOut rs
+             for (int pr = 0; pr < NT / 2; ++pr)
+             {
+                 const int ti = j * 8 + wn * (NT / 2) + pr;
+-                const u32* tile = reinterpret_cast<const u32*>(raw + ti * 128);
++                const u32* tile = reinterpret_cast<const u32*>(raw + ti * C::TB);
+                 tl.decode(tile[tl.i0], tile[tl.i1], bf[2 * pr], bf[2 * pr + 1]);
+             }
+             #pragma unroll
+@@ -1616,6 +1626,19 @@ template <int BM, bool RS, bool F32 = false> inline void launch_tr_bm(const Gemm
+     const dim3 grid((g.N + 127) / 128, (RB + BM - 1) / BM);
+     if (g.h16)
+     {
++#if G6_MODEL_ML4
++        if (g.fmt == 1)
++        {
++            static bool attr_h16k3 = false;
++            if (!attr_h16k3)
++            {
++                cudaFuncSetAttribute(k_gemm_tr_h16<BM, RS, F32, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, GTH16<BM, 1>::SMEM);
++                attr_h16k3 = true;
++            }
++            k_gemm_tr_h16<BM, RS, F32, 1><<<grid, GTH16<BM, 1>::NTH, GTH16<BM, 1>::SMEM, st>>>(g, rs);
++            return;
++        }
++#endif
+         static bool attr_h16 = false;
+         if (!attr_h16)
+         {
+@@ -1651,7 +1674,7 @@ inline void launch_tr(const Gemm& g, const RsOut& rs, bool big, cudaStream_t st)
+ {
+     const int bm = !big ? 4 : knob::pf_tr_bm() == 8 ? 8 : 16;
+     if (rs.base) { if (bm == 16) launch_tr_bm<16, true>(g, rs, st); else if (bm == 8) launch_tr_bm<8, true>(g, rs, st); else launch_tr_bm<4, true>(g, rs, st); }
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+     else if (g.bf16 == 2) { if (bm == 16) launch_tr_bm<16, false, true>(g, rs, st); else if (bm == 8) launch_tr_bm<8, false, true>(g, rs, st); else launch_tr_bm<4, false, true>(g, rs, st); }
+ #endif
+     else if (bm == 16) launch_tr_bm<16, false>(g, rs, st);
+@@ -1706,7 +1729,7 @@ inline void launch(const Gemm& g, cudaStream_t st, int mode, const RsOut& rs = R
+     const bool big = mode == 2 || (mode != 3 && NB * ((RB + 7) / 8) >= 2 * nsm);
+     if (g.tw)                         // dense trellis tiles (k_gemm_tr): never paired, fp16 / BF16 out
+     {
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+         if (g.w2) { fprintf(stderr, "bindp: a trellis Gemm is unpaired\n"); exit(1); }
+ #else
+         if (g.w2 || f32) { fprintf(stderr, "bindp: a trellis Gemm is unpaired with fp16 / BF16 output\n"); exit(1); }
+@@ -1803,7 +1826,9 @@ inline const char* make_gemm_tr(const dtr::Mat& m, int M, const uint8_t* x8, voi
+     g.tw = m.w; g.tsB = m.sB; g.tsG = m.sG;
+     g.N = m.N; g.K = m.K; g.M = M;
+     g.y = y; g.ldy = g.N; g.bf16 = bf16;
+-#if G6_MODEL_FLASH
++#if G6_MODEL_ML4
++    g.h16 = 1; g.fmt = m.fmt;           // ML4: fp16 only (its K3 mul1 matrices have no exact FP8 copy)
++#elif G6_PF_H16
+     g.h16 = knob::pf_dtr8() ? 0 : 1;
+ #endif
+     return nullptr;
+@@ -1842,7 +1867,7 @@ struct Act
+     int I = 0, M = 0;
+     const __half *svh_g = nullptr, *svh_u = nullptr, *suh_d = nullptr;
+     uint8_t* x8 = nullptr;
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+     int h16 = 0;
+ #endif
+ };
+@@ -1871,7 +1896,7 @@ __global__ void __launch_bounds__(256) k_pf_dtr_mid(Act a)
+             r[0] = x.x; r[1] = x.y; r[2] = y.x; r[3] = y.y;
+         };
+         float gv[4], uv[4], sg[4], su[4], sd[4];
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+         if (a.h16 == 2)
+         {
+             f4(a.g + o, gv); f4(a.u + o, uv); f4(a.suh_d + c0, sd);
+@@ -1905,7 +1930,7 @@ __global__ void __launch_bounds__(256) k_pf_dtr_mid(Act a)
+         #pragma unroll
+         for (int e = 0; e < 4; ++e) v[e] = rnd_h(v[e]);
+     }
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+     if (a.h16) { shx_store_h16(v, lane, row, a.M, a.I / 16, b * 8, a.x8); return; }
+ #endif
+     shx_store_mx8(v, lane, row, a.M, a.I / 32, b * 4 + (lane >> 3), a.x8);
+@@ -5535,7 +5560,7 @@ __device__ __forceinline__ void shx_store_mx8(const float (&v)[4], int lane, int
+     *reinterpret_cast<u32*>(rec + ((rr & 7) * 4 + (j & 3)) * 16 + ((j >> 2) * 2 + (rr >> 3)) * 4) = c;
+     if (j == 0) rec[512 + rr] = static_cast<uint8_t>(code);
+ }
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+ // Store 128 rotated fp32 channels (v[4] per lane) as 8 fp16 m16n8k16 A-fragments at x8[(row >> 4) * K16 + ks_base + s][512].
+ // Layout matches mma16816 A-fragment: lane fl = (r8 & 7) * 4 + ((k & 7) >> 1), reg = ((k >> 3) << 1) | (r8 >> 3).
+ __device__ __forceinline__ void shx_store_h16(const float (&v)[4], int lane, int row, int M, int K16, int ks_base, uint8_t* x8)
+diff --git a/engine/kernels/tests/dtr_ml4_test.cu b/engine/kernels/tests/dtr_ml4_test.cu
+index 439fdd5..5becdc6 100644
+--- a/engine/kernels/tests/dtr_ml4_test.cu
++++ b/engine/kernels/tests/dtr_ml4_test.cu
+@@ -11,7 +11,8 @@
+ //   glu GATE UP DOWN          gate and up on GATE.x.bin, then down (dtr::make_glu + make_out)
+ //   gv NAME K O R             F16W GEMV (bind.cuh, G6_MODEL_ML4): NAME.rec.bin u8 [O/16][K/16][512] (fp16 weights in
+ //                             the BF16W record order), NAME.x.bin f16 [R][K]; fp16 fragments by k_xfrag
+-// Outputs: NAME.gemv.M<m>.bin, glu.gemv.M<m>.bin f32 [m][N], M = 1..G6_MX (up to R).
++// Outputs: NAME.gemv.M<m>.bin, glu.gemv.M<m>.bin f32 [m][N], M = 1..G6_MX (up to R); NAME.gemm.bin f16 [R][N], the
++// prefill GEMM (bind_prefill.cuh k_gemm_tr_h16 on Xq::h16 fragments, format 1) over all R rows. Link -lcublas.
+ #include <cstdio>
+ #include <cstdlib>
+ #include <fstream>
+@@ -20,7 +21,7 @@
+ #include <string>
+ #include <vector>
+ #include <cuda_bf16.h>
+-#include "../bind.cuh"
++#include "../bind_prefill.cuh"
+ 
+ #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) { fprintf(stderr, "%s:%d %s: %s\n", __FILE__, __LINE__, #x, cudaGetErrorString(e_)); exit(1); } } while (0)
+ static void die(const std::string& s) { fprintf(stderr, "error: %s\n", s.c_str()); exit(1); }
+@@ -128,6 +129,23 @@ int main(int argc, char** argv)
+         }
+         printf("%s: side %d K %d N %d, %d entries x %lld B (fmt %d): M = 1..%d dumped\n", h.name.c_str(), h.side, h.K, h.N,
+                h.E, h.eb, h.m.fmt, std::min(G6_MX, h.R));
++        {   // the prefill GEMM over all R rows: rotated fp16 A-fragments (Xq, suh), trellis decoded in the GEMM, svh epilogue
++            uint8_t* x8;
++            __half* yh;
++            CK(cudaMalloc(&x8, static_cast<size_t>((h.R + 15) / 16) * (h.K / 16) * 512));
++            CK(cudaMalloc(&yh, static_cast<size_t>(h.R) * h.N * 2));
++            bindp::Gemm g;
++            ok(bindp::make_gemm_tr(h.m, h.R, x8, yh, 0, g));
++            g.pre.on = 1; g.pre.src = static_cast<const __half*>(h.x); g.pre.ld = h.K; g.pre.K = h.K; g.pre.M = h.R;
++            g.pre.dst = x8; g.pre.suh = static_cast<const __half*>(h.suh); g.pre.h16 = 1;
++            g.osvh = static_cast<const __half*>(h.svh);
++            bindp::launch(g, st, 2);
++            CK(cudaStreamSynchronize(st));
++            CK(cudaGetLastError());
++            dump_dev(dir + "/" + h.name + ".gemm.bin", yh, static_cast<size_t>(h.R) * h.N * 2);
++            printf("%s: prefill GEMM h16 fmt %d, %d rows dumped\n", h.name.c_str(), g.fmt, h.R);
++            CK(cudaFree(x8)); CK(cudaFree(yh));
++        }
+     }
+     for (const HostGv& h : gvs)
+     {
+diff --git a/engine/ref/dtr_ml4_ref.py b/engine/ref/dtr_ml4_ref.py
+index 0c4ecdb..ad2712c 100644
+--- a/engine/ref/dtr_ml4_ref.py
++++ b/engine/ref/dtr_ml4_ref.py
+@@ -46,7 +46,7 @@ MATS = [  # name, pack prefix, side, sharded range (side 1: output columns, side
+     ('u0', 'layers.0.feed_forward.w3', 1, (0, 6144)),
+     ('d0', 'layers.0.feed_forward.w2', 2, (0, 6144)),
+ ]
+-R = 8
++R = int(os.environ.get('DTR_R', '8'))   # rows of the inputs; M2 X6 runs 200 for the prefill GEMM (NAME.gemm.bin)
+ GVS = [('kva5', 'layers.5.attention.wkv_a_with_mqa.weight', 576), ('gate5', 'layers.5.gate.weight', 128), ('head', 'output', 2048)]
+ 
+ 
+@@ -147,6 +147,13 @@ def dumps(prefix, N):
+ for name, pre, side, (lo, hi) in MATS:
+     x = torch.from_numpy(np.fromfile(os.path.join(D, name + '.x.bin'), np.float16).reshape(R, -1).astype(np.float32))
+     check(f'{name} ({pre}, side {side})', x @ W[name], dumps(name, W[name].shape[1]))
++    p = os.path.join(D, name + '.gemm.bin')
++    if os.path.exists(p):              # the prefill fp16 GEMM (bind_prefill.cuh k_gemm_tr_h16, format 1), all R rows at once
++        y = np.fromfile(p, np.float16).reshape(R, -1).astype(np.float32)
++        ref = x @ W[name]
++        rel = float((torch.from_numpy(y) - ref).norm() / ref.norm())
++        bad |= not rel <= 1e-3
++        print(f'{name} prefill GEMM (h16, {R} rows): rel L2 vs fp32 x @ W_eff {rel:.3e} -> {"PASS" if rel <= 1e-3 else "FAIL"}')
+ x = torch.from_numpy(np.fromfile(os.path.join(D, 'g0.x.bin'), np.float16).reshape(R, -1).astype(np.float32))
+ a = torch.nn.functional.silu(x @ W['g0']) * (x @ W['u0'])
+ check('glu g0 u0 d0 (layer 0 dense MLP, rank 0 channels)', a @ W['d0'], dumps('glu', W['d0'].shape[1]))
+-- 
+2.43.0
+
+
+From a1ceae51ca357da5d3e80e561ea7fb32692090e4 Mon Sep 17 00:00:00 2001
+From: grubbychicken <ben@grbychkn.com>
+Date: Mon, 9 Nov 2026 16:38:02 +0000
+Subject: [PATCH 2/2] ML4 M2 X6 P2: ML4 prefill (fp16 GEMMs, ML4 router,
+ experts with the shared row as Expert::shr)
+
+- bind_prefill.cuh: the fp16 expert machinery (Expert::h16, scratch layout, H16 kernel paths) under G6_PF_H16;
+  bindp::NEXP = the routed experts (128 on ML4, the shared row 128 is Expert::shr expert NEXP); non-block-scale
+  kernels for mul1 under ML4; k_pf_route_ml4 (glue::k_router_plan_ml4 selection and weights); Blas16 (fp16 cuBLAS,
+  fp32 accumulate), k_f16w_plain (F16W record -> plain fp16), make_layer_ml4 (wq / wo / layer 0 MLP as k_gemm_tr_h16
+  format 1, kv_a / indexer / router as Blas16, experts h16 mul1 with tr3.kmix and shr)
+- prefill.cuh: ML4 buffers and plain copies at build (GR8_PF_OWN / --pfv2 / GR8_PF_ATTN_ROWS refused), pf_layer_ml4,
+  pf_attn_block_ml4 (as rank.cuh launch_attn_block_ml4), pf_mlp_block_ml4
+- dtr_find.h: no FP8 copies for ML4; build_m4.sh: no PF_F12 in the ML4 build (its fp16 MoE refuses it)
+
+Checked (m4sim, M1 subset, 16 prefixes of Q5 seq 0 up to 256 tokens, --prefill 64): the decode row after the prefill
+matches the fp32 reference as the decode-only run does (|lp - ref| mean 0.0041 vs 0.0042), argmax 16/16.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ engine/kernels/bind_prefill.cuh | 307 ++++++++++++++++++++++++++++----
+ engine/runtime/build_m4.sh      |   2 +-
+ engine/runtime/dtr_find.h       |   3 +
+ engine/runtime/prefill.cuh      | 119 +++++++++++++
+ 4 files changed, 393 insertions(+), 38 deletions(-)
+
+diff --git a/engine/kernels/bind_prefill.cuh b/engine/kernels/bind_prefill.cuh
+index c5d857e..a36c72a 100644
+--- a/engine/kernels/bind_prefill.cuh
++++ b/engine/kernels/bind_prefill.cuh
+@@ -55,9 +55,11 @@ using bind::Tensor;
+ constexpr int MB = PF_MB;             // 16-row blocks per CTA (PF_MB: build option)
+ constexpr int RS = MB * 16;           // rows per expert segment
+ constexpr int REC = 528;              // MXFP8 activation record of (16 rows, 32 k): [32 lanes][16 B] A fragments + 16 scale bytes
+-constexpr int NEXP = geom::NEXP, TOPK = geom::TOPK;
++// NEXP = the routed experts. ML4's geometry counts its shared expert as row 128 of the expert table (geom::NEXP = 129);
++// here it is Expert::shr's expert NEXP, after the 128 routed ones, as GLM's trellis shared expert is row 256
++constexpr int NEXP = geom::NEXP - (G6_MODEL_ML4 ? 1 : 0), TOPK = geom::TOPK;
+ constexpr int EPL = NEXP / 32;       // k_pf_route: experts per lane
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+ // Flash MoE expert passes in fp16 (Expert::h16, the Flash default; GR8_PF_MOE8=1 = the MXFP8 passes): fc1 A = the fp16
+ // H128(x * suh) rows, fc2 A = the fp16 mid output, B = the fp16 trellis-decoded fragments, mma m16n8k16 fp32 accumulate.
+ #define PF_H16P , bool H16 = false
+@@ -1993,7 +1995,7 @@ inline const char* make_blas(const Tensor& w, int K, int M, cublasHandle_t h, co
+ struct Expert
+ {
+     int on = 0, M = 0, maxseg = 0;
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+     int h16 = 0;                      // 1: fp16 fc1 / mid / fc2 (x2 then holds fp16 A fragments: [seg][MB][EB][8 k16][32 lanes][4] u32)
+     int e4 = 0;                       // h16 on an exlr8-e4m3 layer: the fp16 weight fragments get the E4M3 round trip of decode (tr3_cb2<true>)
+     int fc2one = 0;                   // h16 + bs: fc2 runs one output Hadamard per 128-col group (GR8_PF_FC2ONE=0: one per block)
+@@ -2060,7 +2062,7 @@ struct Expert
+                                       // only; kept after the pre-cut fields so their kernel offsets stay unchanged
+     int pre_routed = 0;               // 1: tok_e / tok_w already hold every row (GR8_PF_ROUTER_SPLIT: own rows routed here, the
+                                       // peers' rows copied in), so launch_route skips k_pf_route. Host-side only, LAST member but Flash's q8 / hq / hs
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+     int q8 = 0;                       // GR8_PF_Q8=1 (h16 + bs + hx): routed fc1 = k_pf_fc1q on MXFP8 rows hq / hs (k_pf_hxq)
+     uint8_t* hq = nullptr;            // [M][HID] E4M3 of hx, one E8M0 scale per 32 k in hs [M][HID / 32]
+     uint8_t* hs = nullptr;
+@@ -2135,7 +2137,7 @@ template <int K = TOPK> __global__ void __launch_bounds__(256) k_pf_route(Expert
+         if constexpr (K == TOPK)
+         {
+             A.tok_e[m * TOPK + l] = se[l];
+-            #if G6_MODEL_FLASH
++            #if G6_PF_H16
+             A.tok_w[m * TOPK + l] = sw[l] / (sum + 1e-20f) * A.route_scale;
+ #else
+             A.tok_w[m * TOPK + l] = sw[l] / sum * A.route_scale;
+@@ -2144,7 +2146,7 @@ template <int K = TOPK> __global__ void __launch_bounds__(256) k_pf_route(Expert
+         else if (l < K)
+         {
+             A.tok_e[m * TOPK + l] = se[l];
+-            #if G6_MODEL_FLASH
++            #if G6_PF_H16
+             A.tok_w[m * TOPK + l] = sw[l] / (sum + 1e-20f) * A.route_scale;
+ #else
+             A.tok_w[m * TOPK + l] = sw[l] / sum * A.route_scale;
+@@ -2188,7 +2190,7 @@ template <bool CUT = false> __global__ void __launch_bounds__(256) k_pf_fill(Exp
+             int wb = 0, tb = 0;
+             for (int i = 0; i < NEXP; ++i) { wb += (A.cnt[i] + WM_R - 1) / WM_R; tb += (A.cnt[i] + WT_R - 1) / WT_R; }
+             wtb = wb; wttb = tb;
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+             if (A.wt) *A.n_wt = wb + (A.M + WM_R - 1) / WM_R;
+ #endif
+             if (A.wtiles) *A.n_wtiles = tb + (A.M + WT_R - 1) / WT_R;
+@@ -2206,7 +2208,7 @@ template <bool CUT = false> __global__ void __launch_bounds__(256) k_pf_fill(Exp
+             int* sg = A.segs + static_cast<size_t>(segb + i) * 3;
+             sg[0] = NEXP; sg[1] = base + i * RS; sg[2] = min(RS, A.M - i * RS);
+         }
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+         if (A.wt)
+             for (int i = t; i < (A.M + WM_R - 1) / WM_R; i += 256)
+             {
+@@ -2232,7 +2234,7 @@ template <bool CUT = false> __global__ void __launch_bounds__(256) k_pf_fill(Exp
+         for (int i = 0; i < e; ++i) { off += A.cnt[i]; sb += (A.cnt[i] + RS - 1) / RS; wb += (A.cnt[i] + WM_R - 1) / WM_R; tb += (A.cnt[i] + WT_R - 1) / WT_R; }
+         base = off; segb = sb; wtb = wb; wttb = tb;
+         if (e == NEXP - 1 && !A.shr) *A.n_seg = sb + (A.cnt[e] + RS - 1) / RS;
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+         if (A.wt && e == NEXP - 1 && !A.shr) *A.n_wt = wb + (A.cnt[e] + WM_R - 1) / WM_R;
+ #endif
+         if (A.wtiles && e == NEXP - 1 && !A.shr) *A.n_wtiles = tb + (A.cnt[e] + WT_R - 1) / WT_R;
+@@ -2259,7 +2261,7 @@ template <bool CUT = false> __global__ void __launch_bounds__(256) k_pf_fill(Exp
+         int* sg = A.segs + static_cast<size_t>(segb + i) * 3;
+         sg[0] = e; sg[1] = base + i * RS; sg[2] = min(RS, ne - i * RS);
+     }
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+     if (A.wt)
+         for (int i = t; i < (ne + WM_R - 1) / WM_R; i += 256)
+         {
+@@ -2372,7 +2374,7 @@ __device__ __forceinline__ void had128_l16(float (&v)[16], int lane)
+ // 16 B chunk c (0..15) of a 256 B smem row r -> its swizzled slot: the 8 lanes of a 128-bit access (rows r, r + 1, q = 0..3,
+ // chunk q * 4 + j) hit 8 different bank groups. Bit 3 of c is kept, so a slot stays inside the row.
+ __device__ __forceinline__ int swz16(int c, int r) { return c ^ (r & 7) ^ ((c >> 3) << 1); }
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+ // fp16 trellis fragments of a k32 step -> the decode values of an exlr8-e4m3 layer (tr3_cb2<true>: E4M3 RN-even, satfinite)
+ __device__ __forceinline__ u32 pf_e4r(u32 r)
+ {
+@@ -2608,7 +2610,7 @@ __device__ __forceinline__ void fc1_body(const Expert& A, const long long* tr, i
+     // (halves; rows * HID < 2^32).
+     const int sc = t & 15, sr0 = t >> 4;
+     const int sofs = sr0 * 256 + swz16(sc, sr0) * 16;
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+     const bool hxs = H16 && BS && A.hx;          // stage the pre-rotated rows (k_pf_hx); the prologue only scales them
+     const __half* xsrc = hxs ? A.hx : A.x;
+ #else
+@@ -2653,7 +2655,7 @@ __device__ __forceinline__ void fc1_body(const Expert& A, const long long* tr, i
+         {
+         const int pr = pr0 + pp * 64;
+         const bool pact = pg < G && pr < rows;
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+         if (!AOP && PF_PRO && hxs && lead && pg < G && pw * 8 + pp * 64 < rows)      // pre-rotated rows: f16(fp32(hx) * v1b scale of the 128-k block), in place
+         {
+             const int R = (pg << rsh) + pr;
+@@ -2708,7 +2710,7 @@ __device__ __forceinline__ void fc1_body(const Expert& A, const long long* tr, i
+             PF_CK(3)
+             had128_l32(v, lane);
+             PF_CK(4)
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+             if constexpr (H16)        // fp16 rows back into the stage, in place (the lane rewrites the 4 chunks it read)
+             {
+                 if (pact)
+@@ -2772,7 +2774,7 @@ __device__ __forceinline__ void fc1_body(const Expert& A, const long long* tr, i
+         #pragma unroll
+         for (int s = 0; s < 4; ++s)
+         {
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+             if constexpr (H16)
+             {
+                 u32 p0[2], p1[2], q0[2], q1[2];
+@@ -3436,7 +3438,7 @@ __global__ void __launch_bounds__(512, 1) k_pf_fc1h(Expert A)
+ }
+ #endif
+ 
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+ // hx[r] = f16(H128(x[r] * t_sg)) per 128-k block, the lane code of the fc1 prologue without the per-expert block scale:
+ // warp = (8 rows, 128-k block), lane = (row lane / 4, k32 step lane % 4). grid ceil(ceil(M / 8) * HID / 128 / 8), block 256
+ __global__ void __launch_bounds__(256) k_pf_hx(Expert A)
+@@ -4163,7 +4165,7 @@ __global__ void __launch_bounds__(256) k_pf_mid(Expert A)
+     #pragma unroll
+     for (int e = 0; e < 4; ++e) v[e] = rnd_h(v[e]);
+     const int sp = A.rr_sp[route], p = sp % RS;
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+     if constexpr (H16)        // the lane's 4 k (lane * 4 ..) of row p & 15 -> two u32 of the fc2 A fragments of k16 step lane / 4
+     {
+         const int rr = p & 15, kk = (lane * 4) & 15;
+@@ -4414,7 +4416,7 @@ __device__ __forceinline__ void fc2_body_gl(const Expert& A, const long long* tr
+     };
+     // X2 records of block b and the svh slice of (block b, group G) -> stage it & 1
+     auto stage = [&](int it, int G, int b) {
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+         if (!H16)             // fp16: the mma reads the A fragments from global
+ #endif
+         for (int ch = t; ch < MB * 4 * 33; ch += 256)
+@@ -4463,7 +4465,7 @@ __device__ __forceinline__ void fc2_body_gl(const Expert& A, const long long* tr
+         #pragma unroll
+         for (int s = 0; s < 4; ++s)
+         {
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+             if constexpr (H16)
+             {
+                 u32 p0[2], p1[2], q0[2], q1[2];
+@@ -4516,7 +4518,7 @@ __device__ __forceinline__ void fc2_body_gl(const Expert& A, const long long* tr
+                 mma_mx8(acc[mb][1], fa, bf[2], bf[3], sa, 127u);
+             }
+         }
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+         if constexpr (ONE)        // H16 + BS: H(sum_b scl_b z_b) * sign = sum_b H(z_b) * sign * scl_b, one Hadamard per group
+         {
+             const float scl = __half2float(A.t_v3b[(static_cast<size_t>(tr[2]) + b) * (HID / 128) + G]);
+@@ -4696,7 +4698,7 @@ __global__ void __launch_bounds__(256, 2) k_pf_fc2g(Expert A)
+     else if (!K2 || tr[4] == 4) fc2_body_gl<4, EB, BS, ONE PF_H16X, CB>(A, tr, seg, sg[1], sg[2], sA, sZ, sV);
+     else fc2_body_gl<K2 ? 2 : 4, EB, BS, ONE PF_H16X, CB>(A, tr, seg, sg[1], sg[2], sA, sZ, sV);
+ }
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+ // fc2 v2 (h16 + bs + one, the Flash default; GR8_PF_FC2V2=0 = k_pf_fc2g). Per iteration (group G, block b) the CTA
+ // copies the fp16 A fragments of its row blocks (x2, 4 KB per 16-row block) and the weight words of the 8 warps
+ // (64 TB bytes) to shared memory by cp.async, one iteration ahead (k_pf_fc2g reads A by __ldg at the mma and the K4
+@@ -5347,12 +5349,68 @@ template <bool RS = false, bool SHX = false, bool CUT = false> __global__ void _
+ 
+ #include "bind_prefill_wt.cuh"
+ 
++#if G6_MODEL_ML4
++// ML4 router, one warp per row: softmax over the 128 fp32 logits, top 4, weights = the softmax renormalized over them
++// (exp(l_k - l_top) / sum). The selection and the weight arithmetic are glue::k_router_plan_ml4's (same compares, same
++// tie rule: the lower expert), so a prefill row routes as the decode step routes it. The shared expert is not here:
++// it rides as Expert::shr's routes of expert NEXP (weight 1).
++__global__ void __launch_bounds__(256) k_pf_route_ml4(Expert A)
++{
++    static_assert(NEXP == 128 && EPL == 4 && TOPK == 4, "k_pf_route_ml4: 128 routed experts, top 4");
++    const int l = threadIdx.x & 31, m = blockIdx.x * 8 + (threadIdx.x >> 5);
++    if (m >= A.M) return;
++    float key[EPL];
++    #pragma unroll
++    for (int i = 0; i < EPL; ++i) key[i] = A.logits[static_cast<size_t>(m) * NEXP + l + 32 * i];
++    unsigned taken = 0;
++    float my_k = key[0];
++    int my_e = l;
++    #pragma unroll
++    for (int i = 1; i < EPL; ++i)
++        if (key[i] > my_k) { my_k = key[i]; my_e = l + 32 * i; }
++    float top[TOPK];
++    int se[TOPK];
++    for (int k = 0; k < TOPK; ++k)
++    {
++        float bk = my_k;
++        int be = my_e;
++        #pragma unroll
++        for (int o = 16; o > 0; o >>= 1)
++        {
++            const float ok = __shfl_xor_sync(0xffffffffu, bk, o);
++            const int oe = __shfl_xor_sync(0xffffffffu, be, o);
++            if (ok > bk || (ok == bk && oe < be)) { bk = ok; be = oe; }
++        }
++        top[k] = bk; se[k] = be;
++        if ((be & 31) == l)
++        {
++            taken |= 1u << (be >> 5);
++            my_k = -INFINITY;
++            my_e = 0x7fffffff;
++            #pragma unroll
++            for (int i = 0; i < EPL; ++i)
++                if (!(taken >> i & 1) && key[i] > my_k) { my_k = key[i]; my_e = l + 32 * i; }
++        }
++    }
++    float ex[TOPK], sum = 0.f;
++    #pragma unroll
++    for (int k = 0; k < TOPK; ++k) { ex[k] = expf(top[k] - top[0]); sum += ex[k]; }
++    if (l < TOPK)
++    {
++        float wv = ex[0];
++        int ev = se[0];
++        #pragma unroll
++        for (int k = 1; k < TOPK; ++k) if (l == k) { wv = ex[k]; ev = se[k]; }
++        A.tok_e[m * TOPK + l] = ev;
++        A.tok_w[m * TOPK + l] = wv / sum * A.route_scale;
++    }
++}
++#endif
+ inline void launch_route_rows(const Expert& A, cudaStream_t st)     // logits -> tok_e, tok_w of the A.M rows of A
+ {
+-#if G6_MODEL_ML4   // ML4 routes by softmax top-4 + the shared row (glue::k_router_plan_ml4); the prefill router is not ported yet
+-    (void)A; (void)st;
+-    fprintf(stderr, "ML4: the prefill router (k_pf_route) is not ported; run the prompt through the decode path\n");
+-    abort();
++#if G6_MODEL_ML4
++    if (A.topk != TOPK) { fprintf(stderr, "ML4: GR8_MOE_TOPK cuts are a Flash option\n"); abort(); }
++    k_pf_route_ml4<<<(A.M + 7) / 8, 256, 0, st>>>(A);
+ #else
+     switch (A.topk)                 // GR8_MOE_TOPK cut: one instance per K; K = TOPK is the pre-cut kernel
+     {
+@@ -5405,7 +5463,7 @@ template <int EB = g6nr::EB> inline void launch_fc1(const Expert& A, cudaStream_
+     if (!A.on) return;
+     if (A.wtk) { launch_fc1t<EB>(A, st); return; }
+     tr3_cb_dispatch(A.cb, [&](auto C) {
+-        constexpr int CB = decltype(C)::value, NBS = CB == TR3_MCG;     // NBS: the codebook has non-block-scale kernels
++        constexpr int CB = decltype(C)::value, NBS = CB == TR3_MCG || G6_MODEL_ML4;     // NBS: the codebook has non-block-scale kernels
+         const dim3 g(2 * EB, A.maxseg);
+ #ifdef PF_F12
+         if (A.f12 && A.t_wide)
+@@ -5442,7 +5500,7 @@ template <int EB = g6nr::EB> inline void launch_fc1(const Expert& A, cudaStream_
+             return;
+         }
+ #endif
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+         if (A.q8 && A.h16 && A.bs && A.hq)
+         {
+             if (A.k2) k_pf_fc1q<EB, true, CB><<<g, 256, 0, st>>>(A); else k_pf_fc1q<EB, false, CB><<<g, 256, 0, st>>>(A);
+@@ -5463,7 +5521,7 @@ template <int EB = g6nr::EB> inline void launch_fc1(const Expert& A, cudaStream_
+ #endif
+ template <int EB = g6nr::EB> inline void launch_mid(const Expert& A, cudaStream_t st)
+ {
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+     if (A.on && A.h16 && !A.wtk) { k_pf_mid<EB, true><<<((A.nroutes ? A.nroutes : A.M * TOPK) * EB + 7) / 8, 256, 0, st>>>(A); return; }
+ #endif
+     if (A.on) k_pf_mid<EB><<<((A.nroutes ? A.nroutes : A.M * TOPK) * EB + 7) / 8, 256, 0, st>>>(A);
+@@ -5474,9 +5532,9 @@ template <int EB = g6nr::EB> inline void launch_fc2(const Expert& A, cudaStream_
+     if (!A.on) return;
+     if (A.wtk) { launch_fc2t<EB>(A, st); return; }
+     tr3_cb_dispatch(A.cb, [&](auto C) {
+-        constexpr int CB = decltype(C)::value, NBS = CB == TR3_MCG;     // as launch_fc1
++        constexpr int CB = decltype(C)::value, NBS = CB == TR3_MCG || G6_MODEL_ML4;     // as launch_fc1
+         const dim3 g(HID / 128 / FC2GL, A.maxseg);
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+         if (A.h16)
+         {
+             if (A.bs && A.fc2one && A.fc2v2 && A.wm2 && A.wt) { if (A.k2) launch_fc2w<EB, true, CB>(A, st); else launch_fc2w<EB, false, CB>(A, st); }
+@@ -5497,7 +5555,7 @@ template <int EB = g6nr::EB> inline void launch_fc2(const Expert& A, cudaStream_
+     if (!A.on) return;
+     if (A.wtk) { launch_fc2t<EB>(A, st); return; }
+     tr3_cb_dispatch(A.cb, [&](auto C) {
+-        constexpr int CB = decltype(C)::value, NBS = CB == TR3_MCG;     // as launch_fc1
++        constexpr int CB = decltype(C)::value, NBS = CB == TR3_MCG || G6_MODEL_ML4;     // as launch_fc1
+         const dim3 g(HID / 128, A.maxseg);
+         if (A.bs) { if (A.k2) k_pf_fc2<EB, true, true, CB><<<g, 256, 0, st>>>(A); else k_pf_fc2<EB, false, true, CB><<<g, 256, 0, st>>>(A); }
+         else if constexpr (NBS) { if (A.k2) k_pf_fc2<EB, true, false, CB><<<g, 256, 0, st>>>(A); else k_pf_fc2<EB, false, false, CB><<<g, 256, 0, st>>>(A); }
+@@ -5697,7 +5755,7 @@ struct Scratch
+ #ifdef PF_AOP
+     uint8_t* aop;                     // [maxseg][AOP_NS][2][AOPS] (Expert::aop)
+ #endif
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+     __half* hx;                       // [M][HID] Expert::hx
+     uint8_t *hq, *hs;                 // [M][HID], [M][HID / 32] Expert::hq, hs
+     int *wt, *n_wt;                   // Expert::wt, n_wt
+@@ -5711,7 +5769,7 @@ inline size_t scratch_layout(Scratch* s, char* base, int M, int eb = g6nr::EB)
+ {
+     size_t o = 0;
+     auto take = [&](size_t bytes) { char* p = base ? base + o : nullptr; o += (bytes + 255) / 256 * 256; return p; };
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+     // Expert::shr: the shared expert's M routes follow the M * TOPK routed ones (R routes, their segments and wtiles); ysh is
+     // the yw tail (sc.ysh = route Mmax * TOPK; make_layer points Expert::ysh at route M * TOPK of the pass)
+     const size_t RB = (static_cast<size_t>(M) + 15) / 16, m = static_cast<size_t>(M), R0 = m * TOPK, R = R0 + m,
+@@ -5721,7 +5779,7 @@ inline size_t scratch_layout(Scratch* s, char* base, int M, int eb = g6nr::EB)
+ #endif
+     Scratch t;
+     t.Mmax = M;
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+     t.x8_big = reinterpret_cast<uint8_t*>(take(RB * (HID / 32) * 1024));
+     t.x8_up = reinterpret_cast<uint8_t*>(take(RB * (HID / 32) * 1024));
+     t.x8_small = reinterpret_cast<uint8_t*>(take(RB * (g6nr::SMALLW / 32) * 1024));
+@@ -5735,7 +5793,7 @@ inline size_t scratch_layout(Scratch* s, char* base, int M, int eb = g6nr::EB)
+     t.g = reinterpret_cast<__half*>(take(m * SACTW * 2));
+     t.u = reinterpret_cast<__half*>(take(m * SACTW * 2));
+     t.act = reinterpret_cast<__half*>(take(m * SACTW * 2));
+-#if !G6_MODEL_FLASH
++#if !G6_PF_H16
+     t.ysh = reinterpret_cast<__half*>(take(m * HID * 2));
+ #endif
+     t.tok_e = reinterpret_cast<int*>(take(m * TOPK * 4));
+@@ -5757,13 +5815,13 @@ inline size_t scratch_layout(Scratch* s, char* base, int M, int eb = g6nr::EB)
+     t.z1 = reinterpret_cast<__half*>(take(R * 2 * eb * 128 * 2));
+     // x2 row blocks: the larger of the segment layout (ms segments x MB) and the tile layout (max_wtiles_t tiles x WT_R / 16)
+     const size_t x2rb_t = static_cast<size_t>(max_wtiles_t(M)) * (WT_R / 16), x2rb = ms * MB > x2rb_t ? ms * MB : x2rb_t;
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+     t.x2 = reinterpret_cast<uint8_t*>(take(x2rb * eb * 4096));       // >= 4 * REC: also the fp16 A fragments (Expert::h16)
+ #else
+     t.x2 = reinterpret_cast<uint8_t*>(take(x2rb * eb * 4 * REC));
+ #endif
+     t.yw = reinterpret_cast<__half*>(take(R * HID * 2));
+-#if G6_MODEL_FLASH
++#if G6_PF_H16
+     t.ysh = t.yw + R0 * HID;
+     t.hx = reinterpret_cast<__half*>(take(m * HID * 2));
+     const bool q8 = knob::pf_q8();   // the only reader of hq / hs (A.q8)
+@@ -6226,4 +6284,179 @@ inline const char* make_layer(const Tensors& T, int M, const Scratch& sc, const
+     return nullptr;
+ }
+ 
++
++#if G6_MODEL_ML4
++// ------------------------------------------------------------------------------------------ Mistral Large 4 prefill
++// One ML4 layer of one rank over an M-row sub-batch (the recipe's docs/PORT.md section 8, X6), with the decode tensors
++// (bind::LayerTensors): wq / wo / layer 0's dense MLP as the fp16 trellis GEMM (k_gemm_tr_h16 format 1, K3 mul1), the
++// F16W matrices (kv_a, the indexer's wq_b / wk / weights_proj, the router) as fp16 cuBLAS GEMMs on plain fp16 copies,
++// the routed experts as the fp16 passes (Expert::h16, mul1) with the shared expert as Expert::shr's expert NEXP (row 128).
++
++// y [M][O] = x [M][ldx] @ w [O][K]^T, fp16 in, fp32 accumulate, fp16 out (f32: fp32 out) - the decode F16W GEMV's math
++struct Blas16
++{
++    int on = 0, O = 0, K = 0, M = 0, ldx = 0, f32 = 0;
++    cublasHandle_t h = nullptr;
++    const __half* w = nullptr;
++    const __half* x = nullptr;
++    void* y = nullptr;
++};
++inline cublasStatus_t launch(const Blas16& b, cudaStream_t st)
++{
++    if (!b.on) return CUBLAS_STATUS_SUCCESS;
++    const float one = 1.f, zero = 0.f;
++    cublasStatus_t s = cublasSetStream(b.h, st);
++    if (s != CUBLAS_STATUS_SUCCESS) return s;
++    return cublasGemmEx(b.h, CUBLAS_OP_T, CUBLAS_OP_N, b.O, b.M, b.K, &one, b.w, CUDA_R_16F, b.K, b.x, CUDA_R_16F, b.ldx, &zero,
++                        b.y, b.f32 ? CUDA_R_32F : CUDA_R_16F, b.O, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
++}
++inline void launch_ck(const Blas16& b, cudaStream_t st)
++{
++    if (launch(b, st) != CUBLAS_STATUS_SUCCESS) { fprintf(stderr, "bindp: ML4 fp16 cuBLAS GEMM failed (%d x %d x %d)\n", b.M, b.O, b.K); exit(1); }
++}
++
++// F16W record (u8 [O/16][K/16][512], tools/ml4_pack.py f16_record) -> plain fp16 [O][K]. Element j of a 16 x 16 block:
++// lane l = j / 8, q = j % 8, row (l / 4) + 8 [q & 2], column 2 (l % 4) + (q & 1) + 8 [q & 4]
++__global__ void __launch_bounds__(256) k_f16w_plain(const __half* rec, int O, int K, __half* w)
++{
++    const long long i = static_cast<long long>(blockIdx.x) * 256 + threadIdx.x;
++    if (i >= static_cast<long long>(O) * K) return;
++    const int KB = K / 16, j = static_cast<int>(i % 256);
++    const long long blk = i / 256;
++    const int ob = static_cast<int>(blk / KB), kb = static_cast<int>(blk % KB), l = j >> 3, q = j & 7;
++    const int r = (l >> 2) + ((q & 2) ? 8 : 0), c = 2 * (l & 3) + (q & 1) + ((q & 4) ? 8 : 0);
++    w[static_cast<size_t>(ob * 16 + r) * K + kb * 16 + c] = rec[i];
++}
++// a device copy of an F16W record tensor as plain fp16 (nullptr when absent); O = shape[0] * 16, K = shape[1] * 16
++inline __half* f16w_plain(const bind::Tensor& t, int& O, int& K, cudaStream_t st)
++{
++    O = K = 0;
++    if (!t.p) return nullptr;
++    O = static_cast<int>(t.shape[0]) * 16; K = static_cast<int>(t.shape[1]) * 16;
++    __half* w = nullptr;
++    if (cudaMalloc(&w, static_cast<size_t>(O) * K * 2) != cudaSuccess) { fprintf(stderr, "bindp: ML4 plain fp16 copy: out of memory\n"); exit(1); }
++    const long long n = static_cast<long long>(O) * K;
++    k_f16w_plain<<<static_cast<unsigned>((n + 255) / 256), 256, 0, st>>>(static_cast<const __half*>(t.p), O, K, w);
++    return w;
++}
++struct Ml4W                           // plain fp16 copies of one layer's F16W matrices (nullptr: the layer has none)
++{
++    __half *kv_a = nullptr, *iq = nullptr, *ik = nullptr, *iw = nullptr, *rt = nullptr;
++    int kv_aO = 0, iqO = 0, ikO = 0, iwO = 0, rtO = 0;
++    size_t bytes() const { return static_cast<size_t>(kv_aO + iqO + ikO + iwO + rtO) * HID * 2; }
++};
++inline Ml4W ml4_plain(const bind::LayerTensors& T, cudaStream_t st)
++{
++    Ml4W W;
++    int K = 0;
++    W.kv_a = f16w_plain(T.t[bind::T_ML4_KV_A], W.kv_aO, K, st);
++    W.iq = f16w_plain(T.t[bind::T_ML4_IDX_WQ_B], W.iqO, K, st);
++    W.ik = f16w_plain(T.t[bind::T_ML4_IDX_WK], W.ikO, K, st);
++    W.iw = f16w_plain(T.t[bind::T_ML4_IDX_WPROJ], W.iwO, K, st);
++    W.rt = f16w_plain(T.t[bind::T_ML4_ROUTER], W.rtO, K, st);
++    return W;
++}
++struct Ml4Io
++{
++    const __half* x = nullptr;        // in  [M][6144] attention_norm output
++    const __half* x_ln = nullptr;     // in  [M][6144] the indexer's LayerNorm of x (ml4::ln)
++    __half* q_raw = nullptr;          // out [M][H*128] wq
++    __half* kv_a = nullptr;           // out [M][576]
++    __half *idx_q = nullptr, *idx_k = nullptr, *idx_w = nullptr;   // out [M][4096], [M][128], [M][32]
++    const __half* attn_c = nullptr;   // in  [M][H*128] attention output compacted (ml4::compact)
++    uint16_t* attn_part = nullptr;    // out [M][6144] BF16 wo partial
++    const __half* x2 = nullptr;       // in  [M][6144] ffn_norm output
++    float* logits = nullptr;          // out [M][128] fp32 router logits
++    uint16_t* mlp_part = nullptr;     // out [M][6144] BF16 MLP partial
++};
++struct Ml4Layer
++{
++    int M = 0, moe = 0, indexer = 0, heads = 0, inter = 0;
++    Gemm q, o, gate, up, down;        // trellis fp16 GEMMs (pre: the rotated input fragments)
++    Blas16 kv_a, iq, ik, iw, router;
++    Act act;                          // layer 0: k_pf_dtr_mid h16 = 2 (svh of gate / up, suh of down)
++    Expert ex;
++    RsOut rs_o, rs_down;              // GR8_PF_RSDIRECT targets (set by the runtime)
++};
++inline const char* make_layer_ml4(const bind::LayerTensors& T, const Ml4W& W, int M, const Scratch& sc, const Ml4Io& io,
++                                  cublasHandle_t h, Ml4Layer& L)
++{
++    L = Ml4Layer();
++    if (M < 1 || M > sc.Mmax) return "M must be 1..Mmax of the scratch";
++    L.M = M;
++    L.moe = T.t[bind::T_TR3_TAB].p != nullptr;
++    L.indexer = W.iq != nullptr;
++    if (T.mats_err) return T.mats_err;
++    const dtr::LayerMats& D = T.mats;
++    if (!D.q_b.w || !D.o_proj.w || D.q_b.fmt != 1 || D.o_proj.fmt != 1) return "ML4 prefill: wq / wo are not K3 mul1 trellis matrices";
++    auto rot = [&](const __half* src, int K, uint8_t* dst, const __half* suh) {
++        Xq q; q.on = 1; q.src = src; q.ld = K; q.K = K; q.M = M; q.dst = dst; q.suh = suh; q.h16 = 1;
++        return q;
++    };
++    const char* e = nullptr;
++    if ((e = make_gemm_tr(D.q_b, M, sc.x8_big, io.q_raw, 0, L.q))) return e;
++    L.q.pre = rot(io.x, HID, sc.x8_big, D.q_b.suh); L.q.osvh = D.q_b.svh;
++    if ((e = make_gemm_tr(D.o_proj, M, sc.x8_small, io.attn_part, 1, L.o))) return e;
++    L.o.pre = rot(io.attn_c, D.o_proj.K, sc.x8_small, D.o_proj.suh); L.o.osvh = D.o_proj.svh;
++    L.heads = D.q_b.N / 128;
++    auto blas = [&](Blas16& b, const __half* w, int O, const __half* x, void* y, int f32) {
++        if (!w) return;
++        b.on = 1; b.h = h; b.w = w; b.O = O; b.K = HID; b.M = M; b.x = x; b.ldx = HID; b.y = y; b.f32 = f32;
++    };
++    blas(L.kv_a, W.kv_a, W.kv_aO, io.x, io.kv_a, 0);
++    blas(L.iq, W.iq, W.iqO, io.x_ln, io.idx_q, 0);
++    blas(L.ik, W.ik, W.ikO, io.x, io.idx_k, 0);
++    blas(L.iw, W.iw, W.iwO, io.x, io.idx_w, 0);
++    blas(L.router, W.rt, W.rtO, io.x2, io.logits, 1);
++    if (L.kv_a.on && L.kv_a.O != geom::KVA) return "ML4 prefill: kv_a is not [576][6144]";
++    if (L.indexer && (!L.ik.on || !L.iw.on)) return "ML4 prefill: an indexer layer needs wq_b, wk and weights_proj";
++    if (L.moe != L.router.on || (L.router.on && L.router.O != NEXP)) return "ML4 prefill: router [128][6144] and tr3.table must come together";
++    if (D.gate.w)
++    {
++        if (L.moe) return "ML4 prefill: dense trellis MLP tensors in a MoE layer";
++        if (D.gate.fmt != 1 || D.up.fmt != 1 || D.down.fmt != 1) return "ML4 prefill: dense MLP is not K3 mul1";
++        L.inter = D.gate.N;
++        if (L.inter % 128 || L.inter > SACTW) return "ML4 prefill: dense MLP width is not 128-blocks within SACTW";
++        if ((e = make_gemm_tr(D.gate, M, sc.x8_big, sc.g, 0, L.gate))) return e;
++        if ((e = make_gemm_tr(D.up, M, sc.x8_up, sc.u, 0, L.up))) return e;
++        if ((e = make_gemm_tr(D.down, M, sc.x8_small, io.mlp_part, 1, L.down))) return e;
++        L.gate.pre = rot(io.x2, HID, sc.x8_big, D.gate.suh); L.gate.osvh = D.gate.svh;
++        L.up.pre = rot(io.x2, HID, sc.x8_up, D.up.suh); L.up.osvh = D.up.svh;
++        L.down.osvh = D.down.svh;     // its input fragments come from the mid pass (H128(act * suh_d))
++        Act& a = L.act;
++        a.on = 1; a.g = sc.g; a.u = sc.u; a.act = sc.act; a.I = L.inter; a.M = M;
++        a.svh_g = D.gate.svh; a.svh_u = D.up.svh; a.suh_d = D.down.suh; a.x8 = sc.x8_small; a.h16 = 2;
++        return nullptr;
++    }
++    if (!L.moe) return "ML4 prefill: a layer with neither tr3.table nor a dense MLP";
++    const bind::Tensor &tab = T.t[bind::T_TR3_TAB], &v1 = T.t[bind::T_TR3_V1], &v2 = T.t[bind::T_TR3_V2], &v3 = T.t[bind::T_TR3_V3];
++    if (!T.t[bind::T_TR3_FC1].p || !T.t[bind::T_TR3_FC2].p || !v1.p || !v2.p || !v3.p) return "ML4 prefill: MoE layer without tr3.fc1 / fc2 / v1 / v2 / v3";
++    if (tab.nd != 2 || tab.shape[0] != NEXP + 1 || tab.shape[1] != 6) return "ML4 prefill: tr3.table is not 129 rows (128 routed + the shared row)";
++    if (T.cb != TR3_MUL1 || !tr3_cb_built(T.cb)) return "ML4 prefill: the experts are not mul1 (or mul1 is not in this build)";
++    const bind::Tensor& km = T.t[bind::T_TR3_KMIX];   // the units' widths (mixed K), as K1 reads them
++    if (km.p && (km.nd != 1 || km.shape[0] != tab.shape[0])) return "ML4 prefill: tr3.kmix is not one entry per tr3.table row";
++    Expert& A = L.ex;
++    A.on = 1; A.M = M; A.h16 = 1;
++#if defined(PF_F12) || defined(PF_AOP) || defined(PF_HOIST) || !defined(PF_FC2GL)
++    return "ML4 prefill: the fp16 MoE passes need PF_FC2GL and no PF_F12 / PF_AOP / PF_HOIST";
++#endif
++    A.topk = TOPK; A.route_scale = geom::ROUTE_SCALE;
++    A.shr = 1; A.nroutes = M * TOPK + M; A.maxseg = max_segments(M) + (M + RS - 1) / RS;
++    A.logits = io.logits; A.bias = nullptr;
++    A.tok_e = sc.tok_e; A.tok_w = sc.tok_w; A.cnt = sc.cnt;
++    A.rr_row = sc.rr_row; A.rr_e = sc.rr_e; A.rr_sp = sc.rr_sp; A.rr_w = sc.rr_w; A.pos = sc.pos; A.segs = sc.segs; A.n_seg = sc.n_seg;
++    A.t_tab = static_cast<const long long*>(tab.p);
++    A.t_kmix = static_cast<const long long*>(km.p);
++    A.k2 = T.k2; A.cb = T.cb;
++    A.t_fc1 = static_cast<const uint8_t*>(T.t[bind::T_TR3_FC1].p); A.t_wide = T.fc1_wide;
++    A.t_fc2 = static_cast<const uint8_t*>(T.t[bind::T_TR3_FC2].p); A.t_wide2 = T.fc2_wide;
++    A.t_v1 = static_cast<const __half*>(v1.p); A.t_v2 = static_cast<const __half*>(v2.p); A.t_v3 = static_cast<const __half*>(v3.p);
++    A.x = io.x2; A.ldx = HID;
++    A.z1 = sc.z1; A.x2 = sc.x2; A.yw = sc.yw; A.out = io.mlp_part;
++    A.ysh = sc.yw + static_cast<size_t>(M) * TOPK * HID;   // the shared routes' rows: route M * TOPK + row
++    A.sh_svh = nullptr;               // the shared row's svh is applied by fc2 as for every routed row (tr3.v3 row 128)
++    return nullptr;
++}
++#endif
++
+ }   // namespace bindp
+diff --git a/engine/runtime/build_m4.sh b/engine/runtime/build_m4.sh
+index 6eadbe1..cc3e312 100755
+--- a/engine/runtime/build_m4.sh
++++ b/engine/runtime/build_m4.sh
+@@ -104,7 +104,7 @@ WIDTHS=${WIDTHS:-6}
+ wflags() {
+   local f="-DG6_NR=$1 -DDEC_S2"
+   case ${DS41_MX:-} in '') ;; 32|40|48) [ "$ATTN_CU" = ../attn/ds41_attn_dspark.cu ] && f="$f -DG6_MX=$DS41_MX" ;; *) echo "DS41_MX=$DS41_MX: 32, 40 or 48" >&2 ;; esac
+-  case " ${F12_WIDTHS:-4} " in *" $1 "*) [ "$ATTN_CU" = ../attn/attn.cu ] && f="$f -DPF_F12" ;; esac   # PF_F12 (fat-CTA prefill fc1): TP4 by default; F12_WIDTHS="4 5" adds TP5; never in the Flash build
++  case " ${F12_WIDTHS:-4} " in *" $1 "*) [ "$ATTN_CU" = ../attn/attn.cu ] && case " $EXTRA " in *" -DG6_MODEL_ML4=1 "*) ;; *) f="$f -DPF_F12" ;; esac ;; esac   # PF_F12 (fat-CTA prefill fc1): TP4 by default; F12_WIDTHS="4 5" adds TP5; never in the Flash or ML4 builds (their fp16 MoE refuses it)
+   echo "$f"
+ }
+ for n in $WIDTHS; do
+diff --git a/engine/runtime/dtr_find.h b/engine/runtime/dtr_find.h
+index eeada13..bf5b3ae 100644
+--- a/engine/runtime/dtr_find.h
++++ b/engine/runtime/dtr_find.h
+@@ -19,6 +19,9 @@ namespace g6rt
+ inline Find dtr_overlay(const Find& base, bool prefill, cudaStream_t st, int rank)
+ {
+     if (!prefill) return base;
++#if G6_MODEL_ML4
++    return base;                      // ML4's K3 mul1 matrices have no exact FP8 copy: its prefill decodes the tiles (fp16)
++#endif
+ #if G6_MODEL_FLASH
+     if (!knob::pf_dtr8()) return base;
+ #endif
+diff --git a/engine/runtime/prefill.cuh b/engine/runtime/prefill.cuh
+index 3f439be..394c8c4 100644
+--- a/engine/runtime/prefill.cuh
++++ b/engine/runtime/prefill.cuh
+@@ -500,6 +500,11 @@ struct Prefill
+                                                          //   only): <dir>/routes.r<rank>.jsonl, see pf_rcdump
+     void (*dfl_tap)(Model&, Prefill&, int, int, cudaStream_t) = nullptr;   // --dflash: after layer i, keep the prompt rows the
+                                                                             //   drafter reads (dflash.cuh dfl_pf_tap_launch)
++#if G6_MODEL_ML4
++    std::vector<bindp::Ml4W> W4;                         // ML4: per layer, plain fp16 copies of the F16W matrices (cuBLAS)
++    std::map<int, std::vector<bindp::Ml4Layer>> L4;      // ML4 bindings by row count
++    __half *q_raw = nullptr, *x_ln = nullptr, *attn_c = nullptr;   // [Mmax][H*128], [Mmax][6144], [Mmax][H*128]
++#endif
+ };
+ 
+ // m: a built Model whose attention bindings were created with max_rows >= Mmax (build(..., max_rows)).
+@@ -652,6 +657,23 @@ inline void build_prefill(Prefill& P, Model& m, const Find& find, int Mmax, cons
+             for (int i = 0; i < 6; ++i) t.sh_tr[i] = y.T.sh_tr[i];
+         }
+     }
++#if G6_MODEL_ML4
++    // ML4 (the recipe's docs/PORT.md section 8, X6): GLM's prefill flow with the fp16 GEMM family. Its row-owner, QO, pair
++    // and tensor-core attention variants and attention chunking are GLM-shaped and refused here
++    if (P.own || P.ownix || P.qo || P.qp || (share ? share->v2 : P.v2) || chunked)
++        die("ML4 prefill: GR8_PF_OWN, --pfv2 and GR8_PF_ATTN_ROWS are GLM-5.3 paths (not ported)");
++    P.q_raw = dmalloc<__half>(n * g6nr::HMAX * 128);
++    P.x_ln = dmalloc<__half>(n * HID);
++    P.attn_c = dmalloc<__half>(n * g6nr::HMAX * 128);
++    if (share) P.W4 = share->W4;
++    else
++    {
++        size_t b = 0;
++        for (const Layer& y : m.layers) { P.W4.push_back(bindp::ml4_plain(y.T, st)); b += P.W4.back().bytes(); }
++        G6RT_CK(cudaStreamSynchronize(st));
++        if (m.rank == 0) fprintf(stderr, "# rank %d: ML4 prefill fp16 copies of the F16W matrices for %d layers: %.3f GB\n", m.rank, m.nl, b / 1e9);
++    }
++#endif
+     if (P.qp) pf_qp_states(P, m, st, share);
+     if (P.qo && share) P.qa = share->qa;
+     else if (P.qo)
+@@ -1251,9 +1273,102 @@ inline void pf_attn_block_qo(Model& m, Prefill& P, int i, int M, int context, cu
+ // cache_only: stop after the attention call (the MTP layer's prefill pass needs only its caches written)
+ // two-stream lanes (pf_step2s): wait_attn = the other lane is done with this layer's attention binding (scratch,
+ // output, index list); used_attn = recorded once this lane is done with it (after xq_attn read the output)
++#if G6_MODEL_ML4
++inline const bindp::Ml4Layer& pf_layer_ml4(Model& m, Prefill& P, int i, int M)
++{
++    std::vector<bindp::Ml4Layer>& v = P.L4[M];
++    if (v.empty())
++    {
++        if (M < 1 || M > P.Mmax) die("prefill sub-batch larger than Mmax");
++        v.resize(m.nl);
++        for (int j = 0; j < m.nl; ++j)
++        {
++            bindp::Ml4Io io;
++            io.x = P.x; io.x_ln = P.x_ln; io.q_raw = P.q_raw; io.kv_a = P.kv_a;
++            io.idx_q = P.idx_q; io.idx_k = P.idx_k; io.idx_w = P.idx_w; io.attn_c = P.attn_c; io.attn_part = P.part[0];
++            io.x2 = P.x2; io.logits = P.logits; io.mlp_part = P.part[1];
++            if (const char* e = bindp::make_layer_ml4(m.layers[j].T, P.W4[j], M, P.sc, io, P.blas, v[j]))
++                die("rank " + std::to_string(m.rank) + " layer " + std::to_string(m.layers[j].l) + " (ML4 prefill): " + e);
++            if (P.rs && pf_rsdirect())
++            {
++                auto rs = [&](int c) {
++                    bindp::RsOut o;
++                    o.base = P.f.send + (size_t)c * P.f.stride; o.pstride = (size_t)P.f.ncoll * P.f.stride; o.ss = pf_ss(P.f);
++                    o.stepp = P.stepp; o.M = M; o.nr = P.f.nr;
++                    return o;
++                };
++                v[j].rs_o = rs(0);
++                if (v[j].moe) v[j].ex.rs = rs(2); else v[j].rs_down = rs(2);
++            }
++            if (v[j].heads != m.layers[j].ab.args.heads) die("ML4 prefill binder and attention binder disagree on the head count");
++        }
++    }
++    return v[i];
++}
++// as launch_attn_block_ml4 (rank.cuh) over the sub-batch: kv_a, the indexer's k / weights and wq on x; q in GLM's layout;
++// the LayerNorm query on indexer layers; the attention core (every row's keys appended, its causal context); wo
++inline void pf_attn_block_ml4(Model& m, Prefill& P, int i, int M, int context, cudaStream_t st)
++{
++    Layer& y = m.layers[i];
++    const bindp::Ml4Layer& b = pf_layer_ml4(m, P, i, M);
++    pf_mark(7, st);
++    bindp::launch_ck(b.kv_a, st);             // off on KV-sharing layers
++    bindp::launch_ck(b.ik, st);
++    bindp::launch_ck(b.iw, st);
++    bindp::launch(b.q, st);                   // wq -> q_raw
++    ml4::qprep(P.q_raw, P.pos, y.ssmax, y.ab.head_begin, b.heads, geom::rope(y.l) ? 1 : 0, P.q_b, M, st);
++    if (y.indexer)
++    {
++        ml4::ln(P.x, HID, y.idx_qn, HID, P.x_ln, HID, M, st);
++        bindp::launch_ck(b.iq, st);
++        ml4::ssmax(P.idx_q, P.pos, y.idx_ss, geom::IDX_HEADS, geom::IDX_DIM, M, st);
++    }
++    pf_mark(0, st);
++    G6AttnStep s{};
++    s.rows = M; s.context = context;
++    s.q_b = P.q_b; s.kv_a = P.kv_a; s.positions = P.pos;
++    if (y.indexer) { s.index_q = P.idx_q; s.index_k = P.idx_k; s.index_weight = P.idx_w; }
++    else { s.reuse_indices = P.idx_keep ? P.idx_keep : m.layers[y.index_src].ab.args.indices; s.reuse_rows = M; }
++    G6RT_CK(g6_attn_bind_run(&y.ab, &s, st));
++    if (y.indexer && P.idx_keep)
++        G6RT_CK(cudaMemcpyAsync(P.idx_keep, y.ab.args.indices, (size_t)M * 2048 * sizeof(int), cudaMemcpyDeviceToDevice, st));
++    pf_mark(y.indexer ? 8 : 1, st);
++    ml4::compact((const __half*)y.ab.args.output, b.heads, P.attn_c, M, st);
++    bindp::launch(b.o, st, b.rs_o);
++    pf_adump(P, i, "oproj", P.part[0], M, HID * 2, st);
++    pf_mark(2, st);
++    pf_put(P, 0, M, st);
++    pf_mark(3, st);
++}
++inline void pf_mlp_block_ml4(Model& m, Prefill& P, int i, int M, cudaStream_t st)
++{
++    const bindp::Ml4Layer& b = pf_layer_ml4(m, P, i, M);
++    pf_mark(7, st);
++    if (b.moe)
++    {
++        bindp::launch_ck(b.router, st);       // x2 -> fp32 logits [M][128]
++        pf_mark(5, st);
++        bindp::launch_experts(b.ex, st);      // k_pf_route_ml4, then the routed + shared (Expert::shr) fp16 passes
++    }
++    else
++    {
++        bindp::launch(b.gate, st);
++        bindp::launch(b.up, st);
++        bindp::launch(b.act, st);
++        bindp::launch(b.down, st, b.rs_down);
++    }
++    pf_mark(6, st);
++    pf_put(P, 1, M, st);
++    pf_mark(3, st);
++}
++#endif
+ inline void pf_attn_block(Model& m, Prefill& P, int i, int M, int context, cudaStream_t st, bool cache_only = false,
+                           cudaEvent_t wait_attn = nullptr, cudaEvent_t used_attn = nullptr)
+ {
++#if G6_MODEL_ML4
++    if (!cache_only) { pf_attn_block_ml4(m, P, i, M, context, st); return; }
++    die("ML4 prefill: cache-only attention (the drafter's prompt context) is not ported");
++#endif
+     if (P.qo && !cache_only) { pf_attn_block_qo(m, P, i, M, context, st, wait_attn, used_attn); return; }
+     if (P.qp && P.qpl[i] && !cache_only) { pf_attn_block_qp(m, P, i, M, context, st, wait_attn, used_attn); return; }
+     Layer& y = m.layers[i];
+@@ -1535,6 +1650,10 @@ inline void pf_rcdump(Model& m, Prefill& P, int i, int M, const int* cnt, cudaSt
+ }
+ inline void pf_mlp_block(Model& m, Prefill& P, int i, int M, cudaStream_t st)
+ {
++#if G6_MODEL_ML4
++    pf_mlp_block_ml4(m, P, i, M, st);
++    return;
++#endif
+     const bindp::Layer& b = pf_layer(m, P, i, M);
+     pf_mark(7, st);
+     // An exlr8 v2 layer whose shared expert runs from its FP8 copy (Layer::shx) launches these five itself,
+-- 
+2.43.0
+

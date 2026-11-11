@@ -1,0 +1,139 @@
+From 28652edf46b599050171ddedaf033d4c15c0ed76 Mon Sep 17 00:00:00 2001
+From: gr8-ml4 <benjamin.j.millar@gmail.com>
+Date: Mon, 9 Nov 2026 22:43:39 +0000
+Subject: [PATCH] ML4 prefill: one shared fp16 UK/UV converted per layer run
+ instead of 72 resident copies (0.86 -> 0.15 GB, same bytes); front end counts
+ ML4 reasoning tokens
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ engine/attn/prefill.cuh        | 21 +++++++++++++++++++++
+ frontend/g6front-rs/src/api.rs |  5 +++++
+ frontend/g6front-rs/src/gen.rs | 14 ++++++++++++++
+ 3 files changed, 40 insertions(+)
+
+diff --git a/engine/attn/prefill.cuh b/engine/attn/prefill.cuh
+index 9dd6b35..8ede016 100644
+--- a/engine/attn/prefill.cuh
++++ b/engine/attn/prefill.cuh
+@@ -12,6 +12,8 @@
+ #endif
+ struct G6AttnPrefillScratch {
+     void* data=nullptr;size_t bytes=0;int H=0,cap=0,maxrows=0,R=0,dense_limit=0,device=0;bool full_index=false;
++    // ML4 (G6_PF_LAZY_UKUV): one fp16 UK/UV of the widest head group for every layer, converted by each run (gp::lazy_ukuv)
++    void* wdata=nullptr;size_t wbytes=0;
+     cublasHandle_t blas=nullptr;std::atomic<unsigned> refs{1};
+ };
+ struct G6AttnPrefill {
+@@ -24,6 +26,7 @@ struct G6AttnPrefill {
+     ga::half *uk=nullptr,*uv=nullptr,*cache=nullptr,*ikey=nullptr,*q=nullptr,*ctxh=nullptr,*densep=nullptr;
+     int* next=nullptr;float *kscale=nullptr,*qf=nullptr,*prob=nullptr,*ctx=nullptr,*dense=nullptr;
+     cublasHandle_t blas=nullptr;
++    bool lazy=false;   // ML4: uk / uv point into the shared workspace's wdata; each run converts its layer's weights first
+ };
+ namespace gp {
+ using ga::half;using ga::bf16;constexpr int TOP=ga::TOP;
+@@ -275,6 +278,7 @@ static size_t scratch_layout(G6AttnPrefill& p,G6Attn a,void* base){size_t used=0
+ namespace gp {
+ static cudaError_t release_scratch(G6AttnPrefillScratch* w){
+     if(!w||w->refs.fetch_sub(1,std::memory_order_acq_rel)!=1)return cudaSuccess;
++    if(w->wdata)cudaFree(w->wdata);
+     auto bs=cublasDestroy(w->blas);auto e=cudaFree(w->data);delete w;return e!=cudaSuccess?e:cudaError_t(blas_status(bs));
+ }
+ static int create_state(G6AttnPrefill** out,G6AttnBinding* b,void* s,G6AttnPrefill* owner,bool shared){
+@@ -299,6 +303,19 @@ static int create_state(G6AttnPrefill** out,G6AttnBinding* b,void* s,G6AttnPrefi
+     // Charge the shared allocation exactly once to its original root for
+     // existing runtime sum(bytes) reporting. Refcounts, not this accounting,
+     // control lifetime if that root is destroyed before its borrowers.
++#if G6_MODEL_ML4
++    // ML4: no resident fp16 UK/UV per layer (0.53 GB a rank): the shared states' root holds one of the widest group and
++    // each run converts its layer's weights into it first (the same weight_half kernels, so the same bytes)
++    if(shared){
++        auto w=p->workspace;
++        if(!owner){G6AttnPrefill plan=*p;plan.H=g6nr::HMAX;w->wbytes=weight_layout(plan,nullptr);
++            e=cudaMalloc(&w->wdata,w->wbytes);if(e!=cudaSuccess){release_scratch(w);delete p;return int(e);}}
++        p->lazy=true;p->bytes=owner?0:p->workspace->bytes+w->wbytes;
++        e=profile_create(p->profile,events,p->maxrows,p->R);
++        if(e!=cudaSuccess){release_scratch(p->workspace);delete p;return int(e);}
++        weight_layout(*p,w->wdata);scratch_layout(*p,b->args,w->data);p->blas=w->blas;*out=p;return 0;
++    }
++#endif
+     p->bytes=p->weight_bytes+(owner?0:p->workspace->bytes);
+     e=cudaMalloc(&p->storage,p->weight_bytes);if(e!=cudaSuccess){release_scratch(p->workspace);delete p;return int(e);}
+     e=profile_create(p->profile,events,p->maxrows,p->R);
+@@ -334,6 +351,10 @@ extern "C" int g6a_bind_prefill_trace(G6AttnPrefill* p,G6AttnBinding* b,const G6
+     bool profiling=false;rc=int(gp::profile_begin(p->profile,st,a.rows,a.context,a.heads,p->R,!a.reuse_indices,trace!=nullptr,profiling));if(rc)return rc;
+ #define GP_PROFILE() do{if(profiling){rc=int(gp::profile_mark(p->profile,st));if(rc)return rc;}}while(0)
+     G6_PF_MARK(0,st);rc=g6a_append(&a,s);if(rc)return rc;
++    if(p->lazy){   // ML4: this layer's UK / UV into the shared fp16 buffer (create_state's conversion, per run)
++        if(b->args.uks){gp::weight_half_uk<<<(p->H*512*192+255)/256,256,0,st>>>(b->args,p->uk,p->H*512*192);gp::weight_half_uv<<<(p->H*256*512+255)/256,256,0,st>>>(b->args,p->uv,p->H*256*512);}
++        else{gp::weight_half<<<(p->H*512*192+255)/256,256,0,st>>>(b->args.uk,p->uk,p->H*512*192);gp::weight_half<<<(p->H*256*512+255)/256,256,0,st>>>(b->args.uv,p->uv,p->H*256*512);}
++    }
+     // Append validates the public <=64 decode scratch tile. Only the private
+     // prefill workspace below uses the larger tile; no decode ABI is widened.
+     a.query_tile=p->R;int expanded=(a.context+31)&~31;
+diff --git a/frontend/g6front-rs/src/api.rs b/frontend/g6front-rs/src/api.rs
+index 8ec8e8f..c306181 100644
+--- a/frontend/g6front-rs/src/api.rs
++++ b/frontend/g6front-rs/src/api.rs
+@@ -763,6 +763,11 @@ async fn chat(st: &'static State, req: Request<Incoming>) -> Response<HttpBody>
+     if truthy(body.get("return_step_stats")) {
+         gen.want_step_stats();
+     }
++    if st.dialect == Dialect::Ml4 {
++        if let (Some(open), Some(close)) = (st.tok.tk.token_to_id("[THINK]"), st.tok.tk.token_to_id("[/THINK]")) {
++            gen.thinking_in_reply(open, close);
++        }
++    }
+     if guard.is_some() {
+         gen.keep_reply();
+     }
+diff --git a/frontend/g6front-rs/src/gen.rs b/frontend/g6front-rs/src/gen.rs
+index 7dedcf7..969ff3b 100644
+--- a/frontend/g6front-rs/src/gen.rs
++++ b/frontend/g6front-rs/src/gen.rs
+@@ -107,6 +107,8 @@ pub struct Generation {
+     done: bool,
+     /// `</think>` while the reply is inside the think block its prompt opened
+     think_end: Option<u32>,
++    /// Mistral Large 4: the reply opens its own think block; (open, close) ids, counted from a first-token open
++    think_in_reply: Option<(u32, u32)>,
+     budget: Option<Budget>,
+     /// the reply's ids while a budget may still cut it, or always with `keep_reply`: a continuation's prompt needs them
+     reply: Vec<u32>,
+@@ -181,6 +183,7 @@ impl Generation {
+             sent: 0,
+             done: false,
+             think_end: None,
++            think_in_reply: None,
+             budget: None,
+             reply: Vec::new(),
+             offsets: Vec::new(),
+@@ -257,6 +260,12 @@ impl Generation {
+         self.budget = budget.filter(|b| b.limit > 0 && !b.close.is_empty());
+     }
+ 
++    /// The reply may open its own think block with its first token (Mistral Large 4's `[THINK]` .. `[/THINK]`): count
++    /// that block's tokens as reasoning, as `thinking` does for a block the prompt opened.
++    pub fn thinking_in_reply(&mut self, open: u32, close: u32) {
++        self.think_in_reply = Some((open, close));
++    }
++
+     pub fn start(&mut self, engine: &Arc<Engine>) -> Result<(), ApiError> {
+         if !engine.ready() {
+             return Err(ApiError::new(503, "engine not connected", None));
+@@ -576,6 +585,11 @@ impl Generation {
+             }
+             step.logprobs.push(e);
+         }
++        if let Some((open, close)) = self.think_in_reply.take() {
++            if self.res.completion_tokens == 1 && tid == open {
++                self.think_end = Some(close);
++            }
++        }
+         if let Some(end) = self.think_end {
+             self.res.reasoning_tokens += 1;
+             if tid == end {
+-- 
+2.43.0
+

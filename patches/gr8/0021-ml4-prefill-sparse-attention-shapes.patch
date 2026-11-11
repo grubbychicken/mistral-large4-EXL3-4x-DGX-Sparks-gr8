@@ -1,0 +1,1619 @@
+From 07e570b3b9fcf197a084984a4e9d642fcb8d7966 Mon Sep 17 00:00:00 2001
+From: grubbychicken <ben@grbychkn.com>
+Date: Tue, 10 Nov 2026 09:47:09 +0000
+Subject: [PATCH] Prefill sparse attention: same bits in shapes that keep more
+ gathers in flight (28K: 525 -> 577 tok/s)
+
+- normalize_h: normalize's arithmetic, the probabilities rounded to half in place (sparse_pv rounded them on load)
+- sparse_pv_h: 256 context columns x 32 staged keys a CTA (GR8_PF_SPV, default 4; each probability row read twice,
+  not 8 times): values 6.12 -> 3.94 s over 1,152 sparse calls at 28K
+- sparse_qk_v: 128 keys x 32 staged dims a CTA (GR8_PF_SQK, default 1): scores 4.85 -> 3.96 s
+- GR8_PF_USTAT: diagnostic stage timing and the distinct keys of 16 / 32 / 64-row blocks (the union a block-shared
+  attention would read: 5.9K / 7.5K / 9.4K at 20-28K context, 2.9-4.6x the 2048 a row)
+Every output element keeps its operands and accumulation order: offline 28K step lines and 200 generated tokens identical.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/ENV.md                     |   3 +
+ engine/attn/prefill.cuh         | 109 +++++++++++-
+ engine/knobs-rs/gr8_knob_ids.rs | 269 +++++++++++++++---------------
+ engine/knobs-rs/gr8_knobs.h     | 287 +++++++++++++++++---------------
+ knobs/prefill.yaml              |  26 +++
+ 5 files changed, 424 insertions(+), 270 deletions(-)
+
+diff --git a/docs/ENV.md b/docs/ENV.md
+index bcf295a..70132b9 100644
+--- a/docs/ENV.md
++++ b/docs/ENV.md
+@@ -280,6 +280,8 @@ Every rank of one engine must run the same value. The set ones that differ from
+ | `GR8_PF_RSDIRECT` | flag | `0` | 0\|1 | With GR8_PF_RS=1, o_proj, the dense down GEMM and the MoE final sum write straight into the reduce-scatter send slot, so the put only rings the doorbell. |
+ | `GR8_PF_SELX_CTX` | int | `53248` | 32769..1048576 | Prefill index tiles of at least 32 rows at a context of at least this many tokens pick their top keys with SELX instead of SEL32, with the same IDs in the same order. |
+ | `GR8_PF_SHR` | flag | `0` | 0\|1 | 1 runs the Flash trellis shared expert inside the routed MoE pass as extra routes instead of its own pass. Same bytes. |
++| `GR8_PF_SPV` | int | `4` | 0..4 | Prefill sparse attention value pass (same bits): 0 = fp32 probabilities, 64 context columns x 128 staged keys a CTA (the old pass); 1..4 = the probabilities rounded to half in place by the normalize, then 128 x 128, 128 x 64, 64 x 128, 256 x 32 (default: 28K prefill values 6.1 -> 3.9 s). |
++| `GR8_PF_SQK` | int | `1` | 0..4 | Prefill sparse attention score pass (same bits): 0 = 64 keys x 64 staged dims a CTA (the old pass); 1..4 = 128 x 32 (default: 28K prefill scores 4.85 -> 3.96 s), 256 x 32, 128 x 64, 256 x 16. |
+ | `GR8_PF_STREAMS` | int | `1` | 1\|2 | 2 runs the two GLM prefill lanes on two CUDA streams, and any other value keeps one stream. |
+ | `GR8_PF_STRIPE` | flag | 1 with --pf-ips2 or on a three-rank ring, else 0 | 0\|1 | 1 splits large prefill payload writes over two rails (needs --pf-ips2 or --ips2, or a three-rank ring that uses the other PCIe root's device). |
+ | `GR8_PF_TILE` | int | `256` | 64\|128\|256 | Sets the prefill attention query tile in rows. Other values make the attention state fail to create. |
+@@ -405,6 +407,7 @@ These may differ between ranks: paths, per-box resources, logging and timing.
+ | `GR8_PF_RSHASH` | flag | `0` | 0\|1 | Measurement: with GR8_PF_RS=1, syncs the stream after each put and prints an FNV hash of every owner slice of the send slot. |
+ | `GR8_PF_STAGGER` | int | `0` |  | Lane B's prefill stream first sleeps this many microseconds, so its first work starts after lane A's. Writes nothing. |
+ | `GR8_PF_STRIPE_MIN` | int | `1048576` | 8192.. | With GR8_PF_STRIPE=1, the smallest prefill payload write in bytes that goes out split over the two rails. |
++| `GR8_PF_USTAT` | flag | `0` | 0\|1 | Diagnostic: times each prefill attention stage (CUDA events, dense and sparse totals printed every 432 calls) and after each call counts the distinct keys the selections of blocks of 16, 32 and 64 consecutive rows cover (the keys a block-shared attention would read). Synchronizes. |
+ | `GR8_POOL_LOG` | flag | `0` | 0\|1 | Prints one stderr line per S2 pool claim with its first page, page count and the retained runs it evicted. |
+ | `GR8_PROGRESS_ISOLATE` | flag | `1` | 0\|1 | Moves every thread that is not a fabric proxy off this rank's proxy CPUs before the first fabric barrier, so no worker thread preempts a progress thread. 0 turns it off. |
+ | `GR8_QA_SPLIT_CPU` | int | --proxy-cpu minus 9, or -1 when --proxy-cpu is 8 or less |  | Sets the CPU core of the replicated-GEMV gather fabric's proxy thread (GR8_QA_SPLIT, GR8_IDXQ_SPLIT, GR8_MTP_SPLIT). -1 leaves it unpinned. |
+diff --git a/engine/attn/prefill.cuh b/engine/attn/prefill.cuh
+index 8ede016..9da972a 100644
+--- a/engine/attn/prefill.cuh
++++ b/engine/attn/prefill.cuh
+@@ -8,7 +8,19 @@
+ #include "prefill-index-team-profile.cuh"
+ #include "selx.cuh"
+ #ifndef G6_PF_MARK
+-#define G6_PF_MARK(stage, stream) ((void)0)
++// GR8_PF_USTAT: each stage's time (CUDA events between consecutive marks; synchronizes at the call's end)
++namespace gpst {
++static cudaEvent_t ev[64];static int stg[64],n=0,calls=0;static double tot[2][11];static bool sparse=false;
++static inline void mark(int stage,cudaStream_t st){
++    if(!knob::pf_ustat())return;if(!ev[0])for(auto& e:ev)cudaEventCreate(&e);
++    if(n<64){cudaEventRecord(ev[n],st);stg[n++]=stage;}
++    if(stage!=10)return;cudaEventSynchronize(ev[n-1]);
++    for(int i=0;i+1<n;i++){float ms=0;cudaEventElapsedTime(&ms,ev[i],ev[i+1]);tot[sparse][stg[i]]+=ms;}n=0;
++    if(++calls%432==0){static const char* nm[11]={"append","expand","iquery","iscore","select","uk+q","qk","norm","pv","uv","-"};
++        for(int d=0;d<2;d++){fprintf(stderr,"# pf stages %s after %d calls (ms):",d?"sparse":"dense",calls);for(int k=0;k<10;k++)fprintf(stderr," %s %.0f",nm[k],tot[d][k]);fprintf(stderr,"\n");}}
++}
++}
++#define G6_PF_MARK(stage, stream) gpst::mark(stage, stream)
+ #endif
+ struct G6AttnPrefillScratch {
+     void* data=nullptr;size_t bytes=0;int H=0,cap=0,maxrows=0,R=0,dense_limit=0,device=0;bool full_index=false;
+@@ -209,6 +221,69 @@ template<int MT> __global__ void sparse_pv(G6Attn a,int start,int R,const float*
+ #pragma unroll
+  for(int m=0;m<MT;m++)wmma::store_matrix_sync(O+m*16*N+w*16,cc[m],N,wmma::mem_row_major);__syncthreads();for(int i=t;i<hn*N;i+=THREADS){int h=i/N,d=i%N;context[((int64_t)h*R+row)*512+d0+d]=O[i];}
+ }
++// The sparse path, each output element computed as sparse_qk / normalize / sparse_pv do (same operands, same
++// accumulation order: same bits), in shapes that keep more gathers in flight (GR8_PF_SQK / GR8_PF_SPV; 28K prefill,
++// 1,152 sparse calls: scores 4.85 -> 3.96 s, normalize 1.33 -> 0.93, values 6.12 -> 3.94).
++// normalize's arithmetic (same reductions), the probabilities rounded to half (as sparse_pv's operand load rounds them)
++// in place: row-head i's halves are the first TOP*2 bytes of its fp32 scores
++__global__ void __launch_bounds__(256) normalize_h(G6Attn a,float* scores){
++    int i=blockIdx.x,t=threadIdx.x;float* p=scores+(int64_t)i*ga::TOP;__shared__ float tmp[8],mx,den;constexpr int J=ga::TOP/256;float v[J];
++    float m=-INFINITY;
++#pragma unroll
++    for(int u=0;u<J;u++){v[u]=p[t+u*256];m=fmaxf(m,v[u]);}m=ga::warp_max(m);if((t&31)==0)tmp[t/32]=m;__syncthreads();
++    if(t==0){mx=-INFINITY;for(int j=0;j<8;j++)mx=fmaxf(mx,tmp[j]);}__syncthreads();
++    float s=0;
++#pragma unroll
++    for(int u=0;u<J;u++){v[u]=isfinite(mx)?expf(v[u]-mx):0;s+=v[u];}s=ga::warp_sum(s);if((t&31)==0)tmp[t/32]=s;__syncthreads();
++    if(t==0){den=0;for(int j=0;j<8;j++)den+=tmp[j];if(den==0)ga::error(a,16);}__syncthreads();
++    half* o=(half*)p;
++#pragma unroll
++    for(int u=0;u<J;u++)o[t+u*256]=__float2half_rn(den>0?v[u]/den:0);
++}
++// sparse_pv on normalize_h's half probabilities, N context columns a CTA (128: each probability row read 4 times, not 8),
++// K selected keys a staging (the MMA still steps 16 keys at a time in list order)
++template<int MT,int N,int K> __global__ void __launch_bounds__(N*2) sparse_pv_h(G6Attn a,int start,int R,const float* p,const half* cache,float* context){
++ using namespace nvcuda;constexpr int THREADS=N/16*32;int row=blockIdx.y,r=start+row,d0=blockIdx.x*N,t=threadIdx.x,w=t/32;
++ const int hn=min(16*MT,a.heads);
++ constexpr int ARENA=(16*MT+N)*K>16*MT*N*2?(16*MT+N)*K:16*MT*N*2;   // the fp32 output tile reuses it
++ __shared__ __align__(32) half arena[ARENA];half* A=arena;half* B=A+16*MT*K;float* O=(float*)arena;
++ wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major>aa;
++ wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::row_major>bb;
++ wmma::fragment<wmma::accumulator,16,16,16,float>cc[MT];
++#pragma unroll
++ for(int m=0;m<MT;m++)wmma::fill_fragment(cc[m],0.f);
++ for(int base=0;base<ga::TOP;base+=K){
++  for(int i=t;i<16*MT*K/8;i+=THREADS){int h=i/(K/8),j=base+(i%(K/8))*8;((int4*)A)[i]=h<a.heads?*(const int4*)((const half*)(p+((int64_t)row*a.heads+h)*ga::TOP)+j):make_int4(0,0,0,0);}
++  for(int i=t;i<K*N/8;i+=THREADS){int j=base+i/(N/8),d=d0+(i%(N/8))*8,id=a.indices[(int64_t)r*ga::TOP+j];bool ok=id>=0&&id<=a.positions[r]&&id<a.context;((int4*)B)[i]=ok?*(const int4*)(cache+(int64_t)id*576+d):make_int4(0,0,0,0);}
++  __syncthreads();for(int k=0;k<K;k+=16){wmma::load_matrix_sync(bb,B+k*N+w*16,N);
++#pragma unroll
++   for(int m=0;m<MT;m++){wmma::load_matrix_sync(aa,A+m*16*K+k,K);wmma::mma_sync(cc[m],aa,bb,cc[m]);}}__syncthreads();
++ }
++#pragma unroll
++ for(int m=0;m<MT;m++)wmma::store_matrix_sync(O+m*16*N+w*16,cc[m],N,wmma::mem_row_major);__syncthreads();for(int i=t;i<hn*N;i+=THREADS){int h=i/N,d=i%N;context[((int64_t)h*R+row)*512+d0+d]=O[i];}
++}
++// sparse_qk with N selected keys a CTA, staged K dims at a time (the MMA still steps 16 dims in order: same bits)
++template<int MT,int N,int K> __global__ void __launch_bounds__(N*2) sparse_qk_v(G6Attn a,int start,int R,const half* q,const half* cache,float* scores){
++ using namespace nvcuda;constexpr int THREADS=N/16*32;int row=blockIdx.y,r=start+row,k0=blockIdx.x*N,t=threadIdx.x,w=t/32;
++ const int hn=min(16*MT,a.heads);
++ constexpr int ARENA=(16*MT+N)*K>16*MT*N*2?(16*MT+N)*K:16*MT*N*2;
++ __shared__ __align__(32) half arena[ARENA];half* A=arena;half* B=A+16*MT*K;float* O=(float*)arena;
++ wmma::fragment<wmma::matrix_a,16,16,16,half,wmma::row_major>aa;
++ wmma::fragment<wmma::matrix_b,16,16,16,half,wmma::col_major>bb;
++ wmma::fragment<wmma::accumulator,16,16,16,float>cc[MT];
++#pragma unroll
++ for(int m=0;m<MT;m++)wmma::fill_fragment(cc[m],0.f);
++ for(int base=0;base<576;base+=K){
++  for(int i=t;i<16*MT*K/8;i+=THREADS){int h=i/(K/8),d=base+(i%(K/8))*8;((int4*)A)[i]=(h<a.heads&&d<576)?*(const int4*)(q+((int64_t)h*R+row)*576+d):make_int4(0,0,0,0);}
++  for(int i=t;i<N*K/8;i+=THREADS){int j=i/(K/8),d=base+(i%(K/8))*8,id=a.indices[(int64_t)r*ga::TOP+k0+j];bool ok=id>=0&&id<=a.positions[r]&&id<a.context&&d<576;((int4*)B)[i]=ok?*(const int4*)(cache+(int64_t)id*576+d):make_int4(0,0,0,0);}
++  __syncthreads();for(int k=0;k<K;k+=16){wmma::load_matrix_sync(bb,B+w*16*K+k,K);
++#pragma unroll
++   for(int m=0;m<MT;m++){wmma::load_matrix_sync(aa,A+m*16*K+k,K);wmma::mma_sync(cc[m],aa,bb,cc[m]);}}__syncthreads();
++ }
++#pragma unroll
++ for(int m=0;m<MT;m++)wmma::store_matrix_sync(O+m*16*N+w*16,cc[m],N,wmma::mem_row_major);__syncthreads();
++ for(int i=t;i<hn*N;i+=THREADS){int h=i/N,j=i%N,id=a.indices[(int64_t)r*ga::TOP+k0+j];bool ok=id>=0&&id<=a.positions[r]&&id<a.context;scores[((int64_t)row*a.heads+h)*ga::TOP+k0+j]=ok?O[i]*(1.f/16):-INFINITY;}
++}
+ __global__ void dense_gather(G6Attn a,int start,int n,int R,const float* dense,float* score){
+     int i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=n*a.heads*TOP)return;int j=i%TOP,h=(i/TOP)%a.heads,row=i/(TOP*a.heads),r=start+row,id=a.indices[(int64_t)r*TOP+j];bool ok=id>=0&&id<=a.positions[r]&&id<a.context;
+     score[i]=ok?dense[((int64_t)h*R+row)*((a.context+31)&~31)+id]:-INFINITY;
+@@ -227,6 +302,21 @@ __global__ void dense_probabilities(G6Attn a,int n,int R,int D,const float* p,co
+     int64_t i=(int64_t)blockIdx.x*blockDim.x+threadIdx.x;if(i>=(int64_t)a.heads*R*D)return;int id=i%D,row=(i/D)%R,h=i/(D*R);float sum=0;
+     if(row<n&&id<a.context)for(int j=head[(int64_t)row*a.context+id];j>=0;j=next[(int64_t)row*TOP+j])sum+=p[((int64_t)row*a.heads+h)*TOP+j];out[i]=__float2half_rn(sum);
+ }
++// GR8_PF_USTAT: blocks of BR rows -> out[0] += the distinct valid keys of their selections, out[1] += the rows' valid keys
++__global__ void union_count(G6Attn a,int start,int n,int BR,unsigned long long* out){
++    extern __shared__ unsigned bits[];const int words=(a.context+31)/32,r0=blockIdx.x*BR,r1=min(n,r0+BR);__shared__ unsigned tot[2];
++    if(threadIdx.x<2)tot[threadIdx.x]=0;for(int i=threadIdx.x;i<words;i+=blockDim.x)bits[i]=0;__syncthreads();unsigned v=0,u=0;
++    for(int i=threadIdx.x;i<(r1-r0)*TOP;i+=blockDim.x){const int r=start+r0+i/TOP,id=a.indices[(int64_t)r*TOP+i%TOP];if(id>=0&&id<=a.positions[r]&&id<a.context){atomicOr(&bits[id>>5],1u<<(id&31));v++;}}
++    __syncthreads();for(int i=threadIdx.x;i<words;i+=blockDim.x)u+=__popc(bits[i]);atomicAdd(&tot[0],u);atomicAdd(&tot[1],v);__syncthreads();
++    if(threadIdx.x==0){atomicAdd(out,(unsigned long long)tot[0]);atomicAdd(out+1,(unsigned long long)tot[1]);}
++}
++static void union_stats(const G6Attn& a,int start,int n,cudaStream_t st){
++    static unsigned long long* d=nullptr;static int call=0;if(!d&&cudaMalloc(&d,6*8)!=cudaSuccess)return;cudaMemsetAsync(d,0,6*8,st);
++    const int BR[3]={16,32,64};for(int k=0;k<3;k++)union_count<<<(n+BR[k]-1)/BR[k],512,(a.context+31)/32*4,st>>>(a,start,n,BR[k],d+2*k);
++    unsigned long long h[6];cudaMemcpyAsync(h,d,sizeof h,cudaMemcpyDeviceToHost,st);cudaStreamSynchronize(st);
++    fprintf(stderr,"# pf ustat call %d ctx %d rows %d+%d reuse %d: keys/row %.0f, union16 %.0f union32 %.0f union64 %.0f\n",call++,a.context,start,n,
++            a.reuse_indices!=nullptr,double(h[1])/n,double(h[0])/((n+15)/16),double(h[2])/((n+31)/32),double(h[4])/((n+63)/64));
++}
+ __global__ void cast_half(const float* src,half* dst,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)dst[i]=__float2half_rn(src[i]);}
+ __global__ void trace_hmajor(const float* src,float* dst,int start,int n,int R,int H,int D){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n*H*D){int d=i%D,h=(i/D)%H,row=i/(D*H);dst[(int64_t)start*H*D+i]=src[((int64_t)h*R+row)*D+d];}}
+ static void trace_copy(float* dst,const float* src,int start,int n,int H,int D,cudaStream_t st){if(dst)cudaMemcpyAsync(dst+(int64_t)start*H*D,src,(size_t)n*H*D*4,cudaMemcpyDeviceToDevice,st);}
+@@ -374,25 +464,36 @@ extern "C" int g6a_bind_prefill_trace(G6AttnPrefill* p,G6AttnBinding* b,const G6
+         GP_PROFILE();G6_PF_MARK(5,st);gp::pack_uk_input<<<(H*R*192+255)/256,256,0,st>>>(a,start,n,R,p->q);GP_BLAS(cublasGemmStridedBatchedEx(p->blas,CUBLAS_OP_T,CUBLAS_OP_N,512,R,192,&one,p->uk,CUDA_R_16F,192,512*192,
+             p->q,CUDA_R_16F,576,(long long)R*576,&zero,p->qf,CUDA_R_32F,512,(long long)R*512,H,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+         gp::trace_h(tr.q,p->qf,start,n,R,H,512,st);gp::pack_q<<<(R*H*576+255)/256,256,0,st>>>(a,start,n,R,p->qf,p->q);
+-        GP_PROFILE();G6_PF_MARK(6,st);const bool dense=a.context<=p->dense_limit;const int D=expanded;
++        GP_PROFILE();const bool dense=a.context<=p->dense_limit;gpst::sparse=!dense;G6_PF_MARK(6,st);const int D=expanded;
+         const bool mapped=dense&&a.context>0&&D<=8192&&H*ga::TOP>=a.context;
+         if(dense){GP_BLAS(cublasGemmEx(p->blas,CUBLAS_OP_T,CUBLAS_OP_N,D,H*R,576,&scale,p->cache,CUDA_R_16F,576,p->q,CUDA_R_16F,576,&zero,p->dense,CUDA_R_32F,D,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+             if(!mapped)gp::dense_gather<<<(n*H*ga::TOP+255)/256,256,0,st>>>(a,start,n,R,p->dense,p->prob);
+         }else {if(a.heads>32)return int(cudaErrorNotSupported);   // sparse_qk / sparse_pv cover 32 heads a block
+-            if(a.heads>16)gp::sparse_qk<2><<<dim3(ga::TOP/64,n),128,0,st>>>(a,start,R,p->q,p->cache,p->prob);else gp::sparse_qk<1><<<dim3(ga::TOP/64,n),128,0,st>>>(a,start,R,p->q,p->cache,p->prob);}
++            const int sqk=int(knob::pf_sqk());
++#define GP_QKV(N,K) do{if(a.heads>16)gp::sparse_qk_v<2,N,K><<<dim3(ga::TOP/N,n),N*2,0,st>>>(a,start,R,p->q,p->cache,p->prob);else gp::sparse_qk_v<1,N,K><<<dim3(ga::TOP/N,n),N*2,0,st>>>(a,start,R,p->q,p->cache,p->prob);}while(0)
++            if(sqk==1)GP_QKV(128,32);else if(sqk==2)GP_QKV(256,32);else if(sqk==3)GP_QKV(128,64);else if(sqk==4)GP_QKV(256,16);
++            else if(a.heads>16)gp::sparse_qk<2><<<dim3(ga::TOP/64,n),128,0,st>>>(a,start,R,p->q,p->cache,p->prob);else gp::sparse_qk<1><<<dim3(ga::TOP/64,n),128,0,st>>>(a,start,R,p->q,p->cache,p->prob);
++#undef GP_QKV
++        }
++        const int spv=int(knob::pf_spv());const bool half_p=spv&&!dense&&!tr.probs;   // the sparse path's probabilities as halves (normalize_h, sparse_pv_h)
+         G6_PF_MARK(7,st);if(mapped){
+             cudaMemsetAsync(p->prob,0xff,(size_t)R*a.context*4,st);
+             gp::dense_links<<<(n*ga::TOP+255)/256,256,0,st>>>(a,start,n,(int*)p->prob,p->next);
+             gpmap::normalize_expand<<<R*H,256,std::max(D,ga::TOP)*4,st>>>(a,start,n,R,D,p->dense,(const int*)p->prob,p->next,p->densep,tr.scores,tr.probs);
++        }else if(half_p){gp::trace_copy(tr.scores,p->prob,start,n,H,ga::TOP,st);gp::normalize_h<<<n*H,256,0,st>>>(a,p->prob);
+         }else{gp::trace_copy(tr.scores,p->prob,start,n,H,ga::TOP,st);ga::normalize<<<n*H,256,0,st>>>(a,p->prob);gp::trace_copy(tr.probs,p->prob,start,n,H,ga::TOP,st);}
+         G6_PF_MARK(8,st);if(dense){if(!mapped){cudaMemsetAsync(p->dense,0xff,(size_t)R*a.context*4,st);gp::dense_links<<<(n*ga::TOP+255)/256,256,0,st>>>(a,start,n,(int*)p->dense,p->next);gp::dense_probabilities<<<(H*R*D+255)/256,256,0,st>>>(a,n,R,D,p->prob,(const int*)p->dense,p->next,p->densep);}
+             GP_BLAS(cublasGemmEx(p->blas,CUBLAS_OP_N,CUBLAS_OP_N,512,H*R,D,&one,p->cache,CUDA_R_16F,576,p->densep,CUDA_R_16F,D,&zero,p->ctx,CUDA_R_32F,512,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT_TENSOR_OP));
++        }else if(half_p){
++#define GP_PVH(N,K) do{if(a.heads>16)gp::sparse_pv_h<2,N,K><<<dim3(512/N,n),N*2,0,st>>>(a,start,R,p->prob,p->cache,p->ctx);else gp::sparse_pv_h<1,N,K><<<dim3(512/N,n),N*2,0,st>>>(a,start,R,p->prob,p->cache,p->ctx);}while(0)
++            if(spv==1)GP_PVH(128,128);else if(spv==2)GP_PVH(128,64);else if(spv==3)GP_PVH(64,128);else GP_PVH(256,32);
++#undef GP_PVH
+         }else {if(a.heads>16)gp::sparse_pv<2><<<dim3(8,n),128,0,st>>>(a,start,R,p->prob,p->cache,p->ctx);else gp::sparse_pv<1><<<dim3(8,n),128,0,st>>>(a,start,R,p->prob,p->cache,p->ctx);}
+         GP_PROFILE();G6_PF_MARK(9,st);gp::trace_h(tr.context,p->ctx,start,n,R,H,512,st);gp::cast_half<<<(H*R*512+255)/256,256,0,st>>>(p->ctx,p->ctxh,H*R*512);
+         GP_BLAS(cublasGemmStridedBatchedEx(p->blas,CUBLAS_OP_T,CUBLAS_OP_N,256,R,512,&one,p->uv,CUDA_R_16F,512,256*512,p->ctxh,CUDA_R_16F,512,(long long)R*512,&zero,p->q,CUDA_R_16F,256,(long long)R*256,H,CUBLAS_COMPUTE_32F,CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+         gp::unpack_uv<<<(n*H*256+255)/256,256,0,st>>>(a,start,n,R,p->q);GP_PROFILE();
+     }
+-    G6_PF_MARK(10,st);
++    G6_PF_MARK(10,st);if(knob::pf_ustat())gp::union_stats(a,0,a.rows,st);   // after the stage events
+ #undef GP_BLAS
+ #undef GP_PROFILE
+     rc=int(cudaGetLastError());if(!rc&&profiling)p->profile.report.status=G6_PF_PROFILE_READY;return rc;
+diff --git a/engine/knobs-rs/gr8_knob_ids.rs b/engine/knobs-rs/gr8_knob_ids.rs
+index a8aba83..7fb6890 100644
+--- a/engine/knobs-rs/gr8_knob_ids.rs
++++ b/engine/knobs-rs/gr8_knob_ids.rs
+@@ -2,7 +2,7 @@
+ // change the table, not this file. Each knob's id in the C API of gr8_knobs.h; a NAME<n> family takes n as well.
+ 
+ /// The hash of the table these ids are from (gr8_knobs.h knob::TABLE_HASH).
+-pub const TABLE_HASH: u64 = 0xee365179718cba4a;
++pub const TABLE_HASH: u64 = 0x15190b4a671acb95;
+ pub const ATTN_CTX2: u32 = 0;
+ pub const ATTN_CTX3: u32 = 1;
+ pub const ATTN_CTX3_HG: u32 = 2;
+@@ -351,135 +351,138 @@ pub const PF_RSDIRECT: u32 = 344;
+ pub const PF_RSHASH: u32 = 345;
+ pub const PF_SELX_CTX: u32 = 346;
+ pub const PF_SHR: u32 = 347;
+-pub const PF_STAGGER: u32 = 348;
+-pub const PF_STREAMS: u32 = 349;
+-pub const PF_STRIPE: u32 = 350;
+-pub const PF_STRIPE_MIN: u32 = 351;
+-pub const PF_TILE: u32 = 352;
+-pub const PF_TR_BM: u32 = 353;
+-pub const PF_WM: u32 = 354;
+-pub const PF_WM2: u32 = 355;
+-pub const PF_WM_MIN: u32 = 356;
+-pub const PF_WT: u32 = 357;
+-pub const PF_WT_FUSE: u32 = 358;
+-pub const PF_WT_GMAJOR: u32 = 359;
+-pub const POOL_LOG: u32 = 360;
+-pub const PROGRESS_ISOLATE: u32 = 361;
+-pub const PSEUDO_TOKENIZER: u32 = 362;
+-pub const QA_SPLIT: u32 = 363;
+-pub const QA_SPLIT_CPU: u32 = 364;
+-pub const QA_SPLIT_TPC: u32 = 365;
+-pub const QO_CACHE: u32 = 366;
+-pub const QO_DUMP: u32 = 367;
+-pub const QO_NANINJ: u32 = 368;
+-pub const QO_ROPECHK: u32 = 369;
+-pub const QUIT_FAST: u32 = 370;
+-pub const REFUSAL_LINGER: u32 = 371;
+-pub const RESID_DUMP: u32 = 372;
+-pub const REUSE_ALIGN: u32 = 373;
+-pub const REUSE_HDUMP: u32 = 374;
+-pub const REUSE_HDUMP_SEQ: u32 = 375;
+-pub const REUSE_NOEND: u32 = 376;
+-pub const REUSE_POISON: u32 = 377;
+-pub const REUSE_STRICT: u32 = 378;
+-pub const REUSE_ZSCRATCH: u32 = 379;
+-pub const ROUTER_TPC: u32 = 380;
+-pub const ROUTE_LOG: u32 = 381;
+-pub const ROUTE_OVL: u32 = 382;
+-pub const RT_CHECK: u32 = 383;
+-pub const RT_FMT: u32 = 384;
+-pub const RT_L: u32 = 385;
+-pub const RT_LOCAL: u32 = 386;
+-pub const RT_PF_SLICE: u32 = 387;
+-pub const RT_PLACE: u32 = 388;
+-pub const RT_POOL: u32 = 389;
+-pub const RT_SELSTAT: u32 = 390;
+-pub const RT_SIZE: u32 = 391;
+-pub const RT_STORE: u32 = 392;
+-pub const S2_ADAPT: u32 = 393;
+-pub const S2_ADMIT_HOLD: u32 = 394;
+-pub const S2_BELOW: u32 = 395;
+-pub const S2_BIND_DELAY: u32 = 396;
+-pub const S2_DECODE_PF: u32 = 397;
+-pub const S2_DECODE_ROUNDS: u32 = 398;
+-pub const S2_DSEL: u32 = 399;
+-pub const S2_DSEL_DWELL: u32 = 400;
+-pub const S2_DSEL_MARGIN: u32 = 401;
+-pub const S2_DSEL_MODEL: u32 = 402;
+-pub const S2_DSEL_PROBE: u32 = 403;
+-pub const S2_DSEL_TABLE: u32 = 404;
+-pub const S2_EVENTLOG: u32 = 405;
+-pub const S2_FRESH_SPEC: u32 = 406;
+-pub const S2_GROW: u32 = 407;
+-pub const S2_NOTICE_MAX: u32 = 408;
+-pub const S2_REPLAY_LOG: u32 = 409;
+-pub const S2_ROUNDLOG: u32 = 410;
+-pub const S2_SHARE_MS: u32 = 411;
+-pub const S2_TAIL_FIRST: u32 = 412;
+-pub const S2_TIMELINE: u32 = 413;
+-pub const S2_TIMEOUT: u32 = 414;
+-pub const S2_TRACE: u32 = 415;
+-pub const SPEC_DRAFT: u32 = 416;
+-pub const SPEC_TABLE: u32 = 417;
+-pub const STEP_TMR: u32 = 418;
+-pub const TEACHER_DUMP: u32 = 419;
+-pub const TESTS: u32 = 420;
+-pub const TEST_CP_PF_BREAK: u32 = 421;
+-pub const TEST_CP_PF_NET: u32 = 422;
+-pub const TEST_DS41_KERNELS_DIR: u32 = 423;
+-pub const TEST_DS41_M4_PFW: u32 = 424;
+-pub const TEST_DS41_MGATE_DIAG: u32 = 425;
+-pub const TEST_DS41_TOKENIZER_DIR: u32 = 426;
+-pub const TEST_FUZZ_ROUNDS: u32 = 427;
+-pub const TEST_IDX_DUMP: u32 = 428;
+-pub const TEST_KVMAN_LEDGER: u32 = 429;
+-pub const TEST_KVSIM_ENTRIES: u32 = 430;
+-pub const TEST_KV_HASH: u32 = 431;
+-pub const TEST_KV_RANKS_CMP: u32 = 432;
+-pub const TEST_KV_TIER_CHECK: u32 = 433;
+-pub const TEST_KV_TIER_CHECK_DROP: u32 = 434;
+-pub const TEST_LEDGER_CRASH_AT: u32 = 435;
+-pub const TEST_MTP_LASTROW_CHECK: u32 = 436;
+-pub const TEST_PERTURB: u32 = 437;
+-pub const TEST_PF_DRAFTDUMP: u32 = 438;
+-pub const TEST_PF_HASH_POKE: u32 = 439;
+-pub const TEST_PF_REPLAY_VERBOSE: u32 = 440;
+-pub const TEST_PF_RESDUMP: u32 = 441;
+-pub const TEST_PF_TIMES: u32 = 442;
+-pub const TEST_ROW_LINES: u32 = 443;
+-pub const TEST_RT_ADOPT_SLOT: u32 = 444;
+-pub const TEST_RT_POISON: u32 = 445;
+-pub const TEST_S2_ATTN_PERSESSION: u32 = 446;
+-pub const TEST_S2_CLS: u32 = 447;
+-pub const TEST_S2_GEN: u32 = 448;
+-pub const TEST_S2_GROW_POOL: u32 = 449;
+-pub const TEST_S2_INSERT: u32 = 450;
+-pub const TEST_S2_PAGES: u32 = 451;
+-pub const TEST_S2_PFBASE: u32 = 452;
+-pub const TEST_S2_PFNOFIX: u32 = 453;
+-pub const TEST_S2_PFPOISON: u32 = 454;
+-pub const TEST_S2_POOL: u32 = 455;
+-pub const TEST_S2_RELOC: u32 = 456;
+-pub const TEST_S2_RELOC_PAGES: u32 = 457;
+-pub const TEST_S2_ROWHASH: u32 = 458;
+-pub const TEST_S2_RUNS: u32 = 459;
+-pub const TEST_S2_SHRINK_AT: u32 = 460;
+-pub const TEST_S2_SOLO1: u32 = 461;
+-pub const TEST_S2_XLIST: u32 = 462;
+-pub const TEST_TOKENIZER_DIR: u32 = 463;
+-pub const TEST_VISION_CASES: u32 = 464;
+-pub const TEST_ZERO_DELAY_MS: u32 = 465;
+-pub const TMPDIR: u32 = 466;
+-pub const TR3_W2ALL: u32 = 467;
+-pub const V2_SHARED: u32 = 468;
+-pub const WARM: u32 = 469;
+-pub const WEIGHT_CHECK: u32 = 470;
+-pub const WEIGHT_CHECK_FLIP: u32 = 471;
+-pub const WIDTHS: u32 = 472;
+-pub const WORK_DIR: u32 = 473;
+-pub const XGRAMMAR: u32 = 474;
+-pub const XGRAMMAR_LIB: u32 = 475;
+-pub const XTRACE: u32 = 476;
+-pub const XTRACE_OUT: u32 = 477;
+-pub const XTRACE_PF: u32 = 478;
+-pub const XTRACE_QUIT: u32 = 479;
++pub const PF_SPV: u32 = 348;
++pub const PF_SQK: u32 = 349;
++pub const PF_STAGGER: u32 = 350;
++pub const PF_STREAMS: u32 = 351;
++pub const PF_STRIPE: u32 = 352;
++pub const PF_STRIPE_MIN: u32 = 353;
++pub const PF_TILE: u32 = 354;
++pub const PF_TR_BM: u32 = 355;
++pub const PF_USTAT: u32 = 356;
++pub const PF_WM: u32 = 357;
++pub const PF_WM2: u32 = 358;
++pub const PF_WM_MIN: u32 = 359;
++pub const PF_WT: u32 = 360;
++pub const PF_WT_FUSE: u32 = 361;
++pub const PF_WT_GMAJOR: u32 = 362;
++pub const POOL_LOG: u32 = 363;
++pub const PROGRESS_ISOLATE: u32 = 364;
++pub const PSEUDO_TOKENIZER: u32 = 365;
++pub const QA_SPLIT: u32 = 366;
++pub const QA_SPLIT_CPU: u32 = 367;
++pub const QA_SPLIT_TPC: u32 = 368;
++pub const QO_CACHE: u32 = 369;
++pub const QO_DUMP: u32 = 370;
++pub const QO_NANINJ: u32 = 371;
++pub const QO_ROPECHK: u32 = 372;
++pub const QUIT_FAST: u32 = 373;
++pub const REFUSAL_LINGER: u32 = 374;
++pub const RESID_DUMP: u32 = 375;
++pub const REUSE_ALIGN: u32 = 376;
++pub const REUSE_HDUMP: u32 = 377;
++pub const REUSE_HDUMP_SEQ: u32 = 378;
++pub const REUSE_NOEND: u32 = 379;
++pub const REUSE_POISON: u32 = 380;
++pub const REUSE_STRICT: u32 = 381;
++pub const REUSE_ZSCRATCH: u32 = 382;
++pub const ROUTER_TPC: u32 = 383;
++pub const ROUTE_LOG: u32 = 384;
++pub const ROUTE_OVL: u32 = 385;
++pub const RT_CHECK: u32 = 386;
++pub const RT_FMT: u32 = 387;
++pub const RT_L: u32 = 388;
++pub const RT_LOCAL: u32 = 389;
++pub const RT_PF_SLICE: u32 = 390;
++pub const RT_PLACE: u32 = 391;
++pub const RT_POOL: u32 = 392;
++pub const RT_SELSTAT: u32 = 393;
++pub const RT_SIZE: u32 = 394;
++pub const RT_STORE: u32 = 395;
++pub const S2_ADAPT: u32 = 396;
++pub const S2_ADMIT_HOLD: u32 = 397;
++pub const S2_BELOW: u32 = 398;
++pub const S2_BIND_DELAY: u32 = 399;
++pub const S2_DECODE_PF: u32 = 400;
++pub const S2_DECODE_ROUNDS: u32 = 401;
++pub const S2_DSEL: u32 = 402;
++pub const S2_DSEL_DWELL: u32 = 403;
++pub const S2_DSEL_MARGIN: u32 = 404;
++pub const S2_DSEL_MODEL: u32 = 405;
++pub const S2_DSEL_PROBE: u32 = 406;
++pub const S2_DSEL_TABLE: u32 = 407;
++pub const S2_EVENTLOG: u32 = 408;
++pub const S2_FRESH_SPEC: u32 = 409;
++pub const S2_GROW: u32 = 410;
++pub const S2_NOTICE_MAX: u32 = 411;
++pub const S2_REPLAY_LOG: u32 = 412;
++pub const S2_ROUNDLOG: u32 = 413;
++pub const S2_SHARE_MS: u32 = 414;
++pub const S2_TAIL_FIRST: u32 = 415;
++pub const S2_TIMELINE: u32 = 416;
++pub const S2_TIMEOUT: u32 = 417;
++pub const S2_TRACE: u32 = 418;
++pub const SPEC_DRAFT: u32 = 419;
++pub const SPEC_TABLE: u32 = 420;
++pub const STEP_TMR: u32 = 421;
++pub const TEACHER_DUMP: u32 = 422;
++pub const TESTS: u32 = 423;
++pub const TEST_CP_PF_BREAK: u32 = 424;
++pub const TEST_CP_PF_NET: u32 = 425;
++pub const TEST_DS41_KERNELS_DIR: u32 = 426;
++pub const TEST_DS41_M4_PFW: u32 = 427;
++pub const TEST_DS41_MGATE_DIAG: u32 = 428;
++pub const TEST_DS41_TOKENIZER_DIR: u32 = 429;
++pub const TEST_FUZZ_ROUNDS: u32 = 430;
++pub const TEST_IDX_DUMP: u32 = 431;
++pub const TEST_KVMAN_LEDGER: u32 = 432;
++pub const TEST_KVSIM_ENTRIES: u32 = 433;
++pub const TEST_KV_HASH: u32 = 434;
++pub const TEST_KV_RANKS_CMP: u32 = 435;
++pub const TEST_KV_TIER_CHECK: u32 = 436;
++pub const TEST_KV_TIER_CHECK_DROP: u32 = 437;
++pub const TEST_LEDGER_CRASH_AT: u32 = 438;
++pub const TEST_MTP_LASTROW_CHECK: u32 = 439;
++pub const TEST_PERTURB: u32 = 440;
++pub const TEST_PF_DRAFTDUMP: u32 = 441;
++pub const TEST_PF_HASH_POKE: u32 = 442;
++pub const TEST_PF_REPLAY_VERBOSE: u32 = 443;
++pub const TEST_PF_RESDUMP: u32 = 444;
++pub const TEST_PF_TIMES: u32 = 445;
++pub const TEST_ROW_LINES: u32 = 446;
++pub const TEST_RT_ADOPT_SLOT: u32 = 447;
++pub const TEST_RT_POISON: u32 = 448;
++pub const TEST_S2_ATTN_PERSESSION: u32 = 449;
++pub const TEST_S2_CLS: u32 = 450;
++pub const TEST_S2_GEN: u32 = 451;
++pub const TEST_S2_GROW_POOL: u32 = 452;
++pub const TEST_S2_INSERT: u32 = 453;
++pub const TEST_S2_PAGES: u32 = 454;
++pub const TEST_S2_PFBASE: u32 = 455;
++pub const TEST_S2_PFNOFIX: u32 = 456;
++pub const TEST_S2_PFPOISON: u32 = 457;
++pub const TEST_S2_POOL: u32 = 458;
++pub const TEST_S2_RELOC: u32 = 459;
++pub const TEST_S2_RELOC_PAGES: u32 = 460;
++pub const TEST_S2_ROWHASH: u32 = 461;
++pub const TEST_S2_RUNS: u32 = 462;
++pub const TEST_S2_SHRINK_AT: u32 = 463;
++pub const TEST_S2_SOLO1: u32 = 464;
++pub const TEST_S2_XLIST: u32 = 465;
++pub const TEST_TOKENIZER_DIR: u32 = 466;
++pub const TEST_VISION_CASES: u32 = 467;
++pub const TEST_ZERO_DELAY_MS: u32 = 468;
++pub const TMPDIR: u32 = 469;
++pub const TR3_W2ALL: u32 = 470;
++pub const V2_SHARED: u32 = 471;
++pub const WARM: u32 = 472;
++pub const WEIGHT_CHECK: u32 = 473;
++pub const WEIGHT_CHECK_FLIP: u32 = 474;
++pub const WIDTHS: u32 = 475;
++pub const WORK_DIR: u32 = 476;
++pub const XGRAMMAR: u32 = 477;
++pub const XGRAMMAR_LIB: u32 = 478;
++pub const XTRACE: u32 = 479;
++pub const XTRACE_OUT: u32 = 480;
++pub const XTRACE_PF: u32 = 481;
++pub const XTRACE_QUIT: u32 = 482;
+diff --git a/engine/knobs-rs/gr8_knobs.h b/engine/knobs-rs/gr8_knobs.h
+index 47661da..29935cb 100644
+--- a/engine/knobs-rs/gr8_knobs.h
++++ b/engine/knobs-rs/gr8_knobs.h
+@@ -27,7 +27,7 @@ namespace knob
+ {
+ 
+ /// The hash of the table this header was written from.
+-constexpr uint64_t TABLE_HASH = 0xee365179718cba4aull;
++constexpr uint64_t TABLE_HASH = 0x15190b4a671acb95ull;
+ 
+ /// Prints the environment's problems (bad values, unknown GR8_ names, old G6_ names) to stderr and returns the number
+ /// of errors. The engine stops when it is not 0.
+@@ -2513,927 +2513,948 @@ inline bool pf_shr()
+     return v;
+ }
+ 
++/// GR8_PF_SPV
++inline int64_t pf_spv()
++{
++    static const int64_t v = *detail::int_(348, 0);
++    return v;
++}
++
++/// GR8_PF_SQK
++inline int64_t pf_sqk()
++{
++    static const int64_t v = *detail::int_(349, 0);
++    return v;
++}
++
+ /// GR8_PF_STAGGER
+ inline int64_t pf_stagger()
+ {
+-    static const int64_t v = *detail::int_(348, 0);
++    static const int64_t v = *detail::int_(350, 0);
+     return v;
+ }
+ 
+ /// GR8_PF_STREAMS
+ inline int64_t pf_streams()
+ {
+-    static const int64_t v = *detail::int_(349, 0);
++    static const int64_t v = *detail::int_(351, 0);
+     return v;
+ }
+ 
+ /// GR8_PF_STRIPE
+ inline std::optional<bool> pf_stripe()
+ {
+-    static const std::optional<bool> v = detail::flag(350, 0);
++    static const std::optional<bool> v = detail::flag(352, 0);
+     return v;
+ }
+ 
+ /// GR8_PF_STRIPE_MIN
+ inline int64_t pf_stripe_min()
+ {
+-    static const int64_t v = *detail::int_(351, 0);
++    static const int64_t v = *detail::int_(353, 0);
+     return v;
+ }
+ 
+ /// GR8_PF_TILE
+ inline int64_t pf_tile()
+ {
+-    static const int64_t v = *detail::int_(352, 0);
++    static const int64_t v = *detail::int_(354, 0);
+     return v;
+ }
+ 
+ /// GR8_PF_TR_BM
+ inline int64_t pf_tr_bm()
+ {
+-    static const int64_t v = *detail::int_(353, 0);
++    static const int64_t v = *detail::int_(355, 0);
++    return v;
++}
++
++/// GR8_PF_USTAT
++inline bool pf_ustat()
++{
++    static const bool v = *detail::flag(356, 0);
+     return v;
+ }
+ 
+ /// GR8_PF_WM
+ inline bool pf_wm()
+ {
+-    static const bool v = *detail::flag(354, 0);
++    static const bool v = *detail::flag(357, 0);
+     return v;
+ }
+ 
+ /// GR8_PF_WM2
+ inline bool pf_wm2()
+ {
+-    static const bool v = *detail::flag(355, 0);
++    static const bool v = *detail::flag(358, 0);
+     return v;
+ }
+ 
+ /// GR8_PF_WM_MIN
+ inline int64_t pf_wm_min()
+ {
+-    static const int64_t v = *detail::int_(356, 0);
++    static const int64_t v = *detail::int_(359, 0);
+     return v;
+ }
+ 
+ /// GR8_PF_WT
+ inline bool pf_wt()
+ {
+-    static const bool v = *detail::flag(357, 0);
++    static const bool v = *detail::flag(360, 0);
+     return v;
+ }
+ 
+ /// GR8_PF_WT_FUSE
+ inline bool pf_wt_fuse()
+ {
+-    static const bool v = *detail::flag(358, 0);
++    static const bool v = *detail::flag(361, 0);
+     return v;
+ }
+ 
+ /// GR8_PF_WT_GMAJOR
+ inline bool pf_wt_gmajor()
+ {
+-    static const bool v = *detail::flag(359, 0);
++    static const bool v = *detail::flag(362, 0);
+     return v;
+ }
+ 
+ /// GR8_POOL_LOG
+ inline bool pool_log()
+ {
+-    static const bool v = *detail::flag(360, 0);
++    static const bool v = *detail::flag(363, 0);
+     return v;
+ }
+ 
+ /// GR8_PROGRESS_ISOLATE
+ inline bool progress_isolate()
+ {
+-    static const bool v = *detail::flag(361, 0);
++    static const bool v = *detail::flag(364, 0);
+     return v;
+ }
+ 
+ /// GR8_PSEUDO_TOKENIZER
+ inline const std::optional<std::string>& pseudo_tokenizer()
+ {
+-    static const std::optional<std::string> v = detail::text(362, 0);
++    static const std::optional<std::string> v = detail::text(365, 0);
+     return v;
+ }
+ 
+ /// GR8_QA_SPLIT
+ inline std::optional<int64_t> qa_split()
+ {
+-    static const std::optional<int64_t> v = detail::int_(363, 0);
++    static const std::optional<int64_t> v = detail::int_(366, 0);
+     return v;
+ }
+ 
+ /// GR8_QA_SPLIT_CPU
+ inline std::optional<int64_t> qa_split_cpu()
+ {
+-    static const std::optional<int64_t> v = detail::int_(364, 0);
++    static const std::optional<int64_t> v = detail::int_(367, 0);
+     return v;
+ }
+ 
+ /// GR8_QA_SPLIT_TPC
+ inline int64_t qa_split_tpc()
+ {
+-    static const int64_t v = *detail::int_(365, 0);
++    static const int64_t v = *detail::int_(368, 0);
+     return v;
+ }
+ 
+ /// GR8_QO_CACHE
+ inline const std::optional<std::string>& qo_cache()
+ {
+-    static const std::optional<std::string> v = detail::text(366, 0);
++    static const std::optional<std::string> v = detail::text(369, 0);
+     return v;
+ }
+ 
+ /// GR8_QO_DUMP
+ inline bool qo_dump()
+ {
+-    static const bool v = *detail::flag(367, 0);
++    static const bool v = *detail::flag(370, 0);
+     return v;
+ }
+ 
+ /// GR8_QO_NANINJ
+ inline bool qo_naninj()
+ {
+-    static const bool v = *detail::flag(368, 0);
++    static const bool v = *detail::flag(371, 0);
+     return v;
+ }
+ 
+ /// GR8_QO_ROPECHK
+ inline bool qo_ropechk()
+ {
+-    static const bool v = *detail::flag(369, 0);
++    static const bool v = *detail::flag(372, 0);
+     return v;
+ }
+ 
+ /// GR8_QUIT_FAST
+ inline bool quit_fast()
+ {
+-    static const bool v = *detail::flag(370, 0);
++    static const bool v = *detail::flag(373, 0);
+     return v;
+ }
+ 
+ /// GR8_REFUSAL_LINGER
+ inline std::optional<double> refusal_linger()
+ {
+-    static const std::optional<double> v = detail::float_(371, 0);
++    static const std::optional<double> v = detail::float_(374, 0);
+     return v;
+ }
+ 
+ /// GR8_RESID_DUMP
+ inline const std::optional<std::string>& resid_dump()
+ {
+-    static const std::optional<std::string> v = detail::text(372, 0);
++    static const std::optional<std::string> v = detail::text(375, 0);
+     return v;
+ }
+ 
+ /// GR8_REUSE_ALIGN
+ inline std::optional<bool> reuse_align()
+ {
+-    static const std::optional<bool> v = detail::flag(373, 0);
++    static const std::optional<bool> v = detail::flag(376, 0);
+     return v;
+ }
+ 
+ /// GR8_REUSE_HDUMP
+ inline const std::optional<std::string>& reuse_hdump()
+ {
+-    static const std::optional<std::string> v = detail::text(374, 0);
++    static const std::optional<std::string> v = detail::text(377, 0);
+     return v;
+ }
+ 
+ /// GR8_REUSE_HDUMP_SEQ
+ inline const std::optional<std::vector<int64_t>>& reuse_hdump_seq()
+ {
+-    static const std::optional<std::vector<int64_t>> v = detail::ints(375, 0);
++    static const std::optional<std::vector<int64_t>> v = detail::ints(378, 0);
+     return v;
+ }
+ 
+ /// GR8_REUSE_NOEND
+ inline std::optional<bool> reuse_noend()
+ {
+-    static const std::optional<bool> v = detail::flag(376, 0);
++    static const std::optional<bool> v = detail::flag(379, 0);
+     return v;
+ }
+ 
+ /// GR8_REUSE_POISON
+ inline bool reuse_poison()
+ {
+-    static const bool v = *detail::flag(377, 0);
++    static const bool v = *detail::flag(380, 0);
+     return v;
+ }
+ 
+ /// GR8_REUSE_STRICT
+ inline bool reuse_strict()
+ {
+-    static const bool v = *detail::flag(378, 0);
++    static const bool v = *detail::flag(381, 0);
+     return v;
+ }
+ 
+ /// GR8_REUSE_ZSCRATCH
+ inline bool reuse_zscratch()
+ {
+-    static const bool v = *detail::flag(379, 0);
++    static const bool v = *detail::flag(382, 0);
+     return v;
+ }
+ 
+ /// GR8_ROUTER_TPC
+ inline int64_t router_tpc()
+ {
+-    static const int64_t v = *detail::int_(380, 0);
++    static const int64_t v = *detail::int_(383, 0);
+     return v;
+ }
+ 
+ /// GR8_ROUTE_LOG
+ inline const std::optional<std::string>& route_log()
+ {
+-    static const std::optional<std::string> v = detail::text(381, 0);
++    static const std::optional<std::string> v = detail::text(384, 0);
+     return v;
+ }
+ 
+ /// GR8_ROUTE_OVL
+ inline int64_t route_ovl()
+ {
+-    static const int64_t v = *detail::int_(382, 0);
++    static const int64_t v = *detail::int_(385, 0);
+     return v;
+ }
+ 
+ /// GR8_RT_CHECK
+ inline bool rt_check()
+ {
+-    static const bool v = *detail::flag(383, 0);
++    static const bool v = *detail::flag(386, 0);
+     return v;
+ }
+ 
+ /// GR8_RT_FMT
+ inline const std::string& rt_fmt()
+ {
+-    static const std::string v = *detail::text(384, 0);
++    static const std::string v = *detail::text(387, 0);
+     return v;
+ }
+ 
+ /// GR8_RT_L
+ inline std::optional<int64_t> rt_l()
+ {
+-    static const std::optional<int64_t> v = detail::int_(385, 0);
++    static const std::optional<int64_t> v = detail::int_(388, 0);
+     return v;
+ }
+ 
+ /// GR8_RT_LOCAL
+ inline int64_t rt_local()
+ {
+-    static const int64_t v = *detail::int_(386, 0);
++    static const int64_t v = *detail::int_(389, 0);
+     return v;
+ }
+ 
+ /// GR8_RT_PF_SLICE
+ inline bool rt_pf_slice()
+ {
+-    static const bool v = *detail::flag(387, 0);
++    static const bool v = *detail::flag(390, 0);
+     return v;
+ }
+ 
+ /// GR8_RT_PLACE
+ inline std::optional<int64_t> rt_place()
+ {
+-    static const std::optional<int64_t> v = detail::int_(388, 0);
++    static const std::optional<int64_t> v = detail::int_(391, 0);
+     return v;
+ }
+ 
+ /// GR8_RT_POOL
+ inline std::optional<int64_t> rt_pool()
+ {
+-    static const std::optional<int64_t> v = detail::int_(389, 0);
++    static const std::optional<int64_t> v = detail::int_(392, 0);
+     return v;
+ }
+ 
+ /// GR8_RT_SELSTAT
+ inline bool rt_selstat()
+ {
+-    static const bool v = *detail::flag(390, 0);
++    static const bool v = *detail::flag(393, 0);
+     return v;
+ }
+ 
+ /// GR8_RT_SIZE
+ inline std::optional<int64_t> rt_size()
+ {
+-    static const std::optional<int64_t> v = detail::int_(391, 0);
++    static const std::optional<int64_t> v = detail::int_(394, 0);
+     return v;
+ }
+ 
+ /// GR8_RT_STORE
+ inline const std::optional<std::string>& rt_store()
+ {
+-    static const std::optional<std::string> v = detail::text(392, 0);
++    static const std::optional<std::string> v = detail::text(395, 0);
+     return v;
+ }
+ 
+ /// GR8_S2_ADAPT
+ inline bool s2_adapt()
+ {
+-    static const bool v = *detail::flag(393, 0);
++    static const bool v = *detail::flag(396, 0);
+     return v;
+ }
+ 
+ /// GR8_S2_ADMIT_HOLD
+ inline bool s2_admit_hold()
+ {
+-    static const bool v = *detail::flag(394, 0);
++    static const bool v = *detail::flag(397, 0);
+     return v;
+ }
+ 
+ /// GR8_S2_BELOW
+ inline std::optional<int64_t> s2_below()
+ {
+-    static const std::optional<int64_t> v = detail::int_(395, 0);
++    static const std::optional<int64_t> v = detail::int_(398, 0);
+     return v;
+ }
+ 
+ /// GR8_S2_BIND_DELAY
+ inline const std::optional<std::string>& s2_bind_delay()
+ {
+-    static const std::optional<std::string> v = detail::text(396, 0);
++    static const std::optional<std::string> v = detail::text(399, 0);
+     return v;
+ }
+ 
+ /// GR8_S2_DECODE_PF
+ inline int64_t s2_decode_pf()
+ {
+-    static const int64_t v = *detail::int_(397, 0);
++    static const int64_t v = *detail::int_(400, 0);
+     return v;
+ }
+ 
+ /// GR8_S2_DECODE_ROUNDS
+ inline int64_t s2_decode_rounds()
+ {
+-    static const int64_t v = *detail::int_(398, 0);
++    static const int64_t v = *detail::int_(401, 0);
+     return v;
+ }
+ 
+ /// GR8_S2_DSEL
+ inline bool s2_dsel()
+ {
+-    static const bool v = *detail::flag(399, 0);
++    static const bool v = *detail::flag(402, 0);
+     return v;
+ }
+ 
+ /// GR8_S2_DSEL_DWELL
+ inline int64_t s2_dsel_dwell()
+ {
+-    static const int64_t v = *detail::int_(400, 0);
++    static const int64_t v = *detail::int_(403, 0);
+     return v;
+ }
+ 
+ /// GR8_S2_DSEL_MARGIN
+ inline double s2_dsel_margin()
+ {
+-    static const double v = *detail::float_(401, 0);
++    static const double v = *detail::float_(404, 0);
+     return v;
+ }
+ 
+ /// GR8_S2_DSEL_MODEL
+ inline bool s2_dsel_model()
+ {
+-    static const bool v = *detail::flag(402, 0);
++    static const bool v = *detail::flag(405, 0);
+     return v;
+ }
+ 
+ /// GR8_S2_DSEL_PROBE
+ inline int64_t s2_dsel_probe()
+ {
+-    static const int64_t v = *detail::int_(403, 0);
++    static const int64_t v = *detail::int_(406, 0);
+     return v;
+ }
+ 
+ /// GR8_S2_DSEL_TABLE
+ inline const std::optional<std::string>& s2_dsel_table()
+ {
+-    static const std::optional<std::string> v = detail::text(404, 0);
++    static const std::optional<std::string> v = detail::text(407, 0);
+     return v;
+ }
+ 
+ /// GR8_S2_EVENTLOG
+ inline bool s2_eventlog()
+ {
+-    static const bool v = *detail::flag(405, 0);
++    static const bool v = *detail::flag(408, 0);
+     return v;
+ }
+ 
+ /// GR8_S2_FRESH_SPEC
+ inline bool s2_fresh_spec()
+ {
+-    static const bool v = *detail::flag(406, 0);
++    static const bool v = *detail::flag(409, 0);
+     return v;
+ }
+ 
+ /// GR8_S2_GROW
+ inline bool s2_grow()
+ {
+-    static const bool v = *detail::flag(407, 0);
++    static const bool v = *detail::flag(410, 0);
+     return v;
+ }
+ 
+ /// GR8_S2_NOTICE_MAX
+ inline int64_t s2_notice_max()
+ {
+-    static const int64_t v = *detail::int_(408, 0);
++    static const int64_t v = *detail::int_(411, 0);
+     return v;
+ }
+ 
+ /// GR8_S2_REPLAY_LOG
+ inline const std::optional<std::string>& s2_replay_log()
+ {
+-    static const std::optional<std::string> v = detail::text(409, 0);
++    static const std::optional<std::string> v = detail::text(412, 0);
+     return v;
+ }
+ 
+ /// GR8_S2_ROUNDLOG
+ inline bool s2_roundlog()
+ {
+-    static const bool v = *detail::flag(410, 0);
++    static const bool v = *detail::flag(413, 0);
+     return v;
+ }
+ 
+ /// GR8_S2_SHARE_MS
+ inline int64_t s2_share_ms()
+ {
+-    static const int64_t v = *detail::int_(411, 0);
++    static const int64_t v = *detail::int_(414, 0);
+     return v;
+ }
+ 
+ /// GR8_S2_TAIL_FIRST
+ inline bool s2_tail_first()
+ {
+-    static const bool v = *detail::flag(412, 0);
++    static const bool v = *detail::flag(415, 0);
+     return v;
+ }
+ 
+ /// GR8_S2_TIMELINE
+ inline int64_t s2_timeline()
+ {
+-    static const int64_t v = *detail::int_(413, 0);
++    static const int64_t v = *detail::int_(416, 0);
+     return v;
+ }
+ 
+ /// GR8_S2_TIMEOUT
+ inline int64_t s2_timeout()
+ {
+-    static const int64_t v = *detail::int_(414, 0);
++    static const int64_t v = *detail::int_(417, 0);
+     return v;
+ }
+ 
+ /// GR8_S2_TRACE
+ inline const std::optional<std::string>& s2_trace()
+ {
+-    static const std::optional<std::string> v = detail::text(415, 0);
++    static const std::optional<std::string> v = detail::text(418, 0);
+     return v;
+ }
+ 
+ /// GR8_SPEC_DRAFT
+ inline const std::vector<double>& spec_draft()
+ {
+-    static const std::vector<double> v = *detail::floats(416, 0);
++    static const std::vector<double> v = *detail::floats(419, 0);
+     return v;
+ }
+ 
+ /// GR8_SPEC_TABLE
+ inline const std::optional<std::vector<double>>& spec_table()
+ {
+-    static const std::optional<std::vector<double>> v = detail::floats(417, 0);
++    static const std::optional<std::vector<double>> v = detail::floats(420, 0);
+     return v;
+ }
+ 
+ /// GR8_STEP_TMR
+ inline bool step_tmr()
+ {
+-    static const bool v = *detail::flag(418, 0);
++    static const bool v = *detail::flag(421, 0);
+     return v;
+ }
+ 
+ /// GR8_TEACHER_DUMP
+ inline const std::optional<std::string>& teacher_dump()
+ {
+-    static const std::optional<std::string> v = detail::text(419, 0);
++    static const std::optional<std::string> v = detail::text(422, 0);
+     return v;
+ }
+ 
+ /// GR8_TESTS
+ inline const std::string& tests()
+ {
+-    static const std::string v = *detail::text(420, 0);
++    static const std::string v = *detail::text(423, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_CP_PF_BREAK
+ inline const std::optional<std::string>& test_cp_pf_break()
+ {
+-    static const std::optional<std::string> v = detail::text(421, 0);
++    static const std::optional<std::string> v = detail::text(424, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_CP_PF_NET
+ inline bool test_cp_pf_net()
+ {
+-    static const bool v = *detail::flag(422, 0);
++    static const bool v = *detail::flag(425, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_DS41_KERNELS_DIR
+ inline const std::optional<std::string>& test_ds41_kernels_dir()
+ {
+-    static const std::optional<std::string> v = detail::text(423, 0);
++    static const std::optional<std::string> v = detail::text(426, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_DS41_M4_PFW
+ inline int64_t test_ds41_m4_pfw()
+ {
+-    static const int64_t v = *detail::int_(424, 0);
++    static const int64_t v = *detail::int_(427, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_DS41_MGATE_DIAG
+ inline bool test_ds41_mgate_diag()
+ {
+-    static const bool v = *detail::flag(425, 0);
++    static const bool v = *detail::flag(428, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_DS41_TOKENIZER_DIR
+ inline const std::optional<std::string>& test_ds41_tokenizer_dir()
+ {
+-    static const std::optional<std::string> v = detail::text(426, 0);
++    static const std::optional<std::string> v = detail::text(429, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_FUZZ_ROUNDS
+ inline int64_t test_fuzz_rounds()
+ {
+-    static const int64_t v = *detail::int_(427, 0);
++    static const int64_t v = *detail::int_(430, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_IDX_DUMP
+ inline const std::optional<std::string>& test_idx_dump()
+ {
+-    static const std::optional<std::string> v = detail::text(428, 0);
++    static const std::optional<std::string> v = detail::text(431, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_KVMAN_LEDGER
+ inline const std::string& test_kvman_ledger()
+ {
+-    static const std::string v = *detail::text(429, 0);
++    static const std::string v = *detail::text(432, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_KVSIM_ENTRIES
+ inline bool test_kvsim_entries()
+ {
+-    static const bool v = *detail::flag(430, 0);
++    static const bool v = *detail::flag(433, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_KV_HASH
+ inline bool test_kv_hash()
+ {
+-    static const bool v = *detail::flag(431, 0);
++    static const bool v = *detail::flag(434, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_KV_RANKS_CMP
+ inline bool test_kv_ranks_cmp()
+ {
+-    static const bool v = *detail::flag(432, 0);
++    static const bool v = *detail::flag(435, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_KV_TIER_CHECK
+ inline const std::optional<std::string>& test_kv_tier_check()
+ {
+-    static const std::optional<std::string> v = detail::text(433, 0);
++    static const std::optional<std::string> v = detail::text(436, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_KV_TIER_CHECK_DROP
+ inline std::optional<int64_t> test_kv_tier_check_drop()
+ {
+-    static const std::optional<int64_t> v = detail::int_(434, 0);
++    static const std::optional<int64_t> v = detail::int_(437, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_LEDGER_CRASH_AT
+ inline const std::optional<std::string>& test_ledger_crash_at()
+ {
+-    static const std::optional<std::string> v = detail::text(435, 0);
++    static const std::optional<std::string> v = detail::text(438, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_MTP_LASTROW_CHECK
+ inline bool test_mtp_lastrow_check()
+ {
+-    static const bool v = *detail::flag(436, 0);
++    static const bool v = *detail::flag(439, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_PERTURB
+ inline double test_perturb()
+ {
+-    static const double v = *detail::float_(437, 0);
++    static const double v = *detail::float_(440, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_PF_DRAFTDUMP
+ inline const std::optional<std::string>& test_pf_draftdump()
+ {
+-    static const std::optional<std::string> v = detail::text(438, 0);
++    static const std::optional<std::string> v = detail::text(441, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_PF_HASH_POKE
+ inline const std::optional<std::vector<int64_t>>& test_pf_hash_poke()
+ {
+-    static const std::optional<std::vector<int64_t>> v = detail::ints(439, 0);
++    static const std::optional<std::vector<int64_t>> v = detail::ints(442, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_PF_REPLAY_VERBOSE
+ inline bool test_pf_replay_verbose()
+ {
+-    static const bool v = *detail::flag(440, 0);
++    static const bool v = *detail::flag(443, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_PF_RESDUMP
+ inline const std::optional<std::string>& test_pf_resdump()
+ {
+-    static const std::optional<std::string> v = detail::text(441, 0);
++    static const std::optional<std::string> v = detail::text(444, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_PF_TIMES
+ inline bool test_pf_times()
+ {
+-    static const bool v = *detail::flag(442, 0);
++    static const bool v = *detail::flag(445, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_ROW_LINES
+ inline bool test_row_lines()
+ {
+-    static const bool v = *detail::flag(443, 0);
++    static const bool v = *detail::flag(446, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_RT_ADOPT_SLOT
+ inline bool test_rt_adopt_slot()
+ {
+-    static const bool v = *detail::flag(444, 0);
++    static const bool v = *detail::flag(447, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_RT_POISON
+ inline bool test_rt_poison()
+ {
+-    static const bool v = *detail::flag(445, 0);
++    static const bool v = *detail::flag(448, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_S2_ATTN_PERSESSION
+ inline bool test_s2_attn_persession()
+ {
+-    static const bool v = *detail::flag(446, 0);
++    static const bool v = *detail::flag(449, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_S2_CLS
+ inline int64_t test_s2_cls()
+ {
+-    static const int64_t v = *detail::int_(447, 0);
++    static const int64_t v = *detail::int_(450, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_S2_GEN
+ inline const std::optional<std::vector<int64_t>>& test_s2_gen()
+ {
+-    static const std::optional<std::vector<int64_t>> v = detail::ints(448, 0);
++    static const std::optional<std::vector<int64_t>> v = detail::ints(451, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_S2_GROW_POOL
+ inline std::optional<int64_t> test_s2_grow_pool()
+ {
+-    static const std::optional<int64_t> v = detail::int_(449, 0);
++    static const std::optional<int64_t> v = detail::int_(452, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_S2_INSERT
+ inline const std::optional<std::string>& test_s2_insert()
+ {
+-    static const std::optional<std::string> v = detail::text(450, 0);
++    static const std::optional<std::string> v = detail::text(453, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_S2_PAGES
+ inline const std::optional<std::vector<int64_t>>& test_s2_pages()
+ {
+-    static const std::optional<std::vector<int64_t>> v = detail::ints(451, 0);
++    static const std::optional<std::vector<int64_t>> v = detail::ints(454, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_S2_PFBASE
+ inline const std::optional<std::vector<int64_t>>& test_s2_pfbase()
+ {
+-    static const std::optional<std::vector<int64_t>> v = detail::ints(452, 0);
++    static const std::optional<std::vector<int64_t>> v = detail::ints(455, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_S2_PFNOFIX
+ inline bool test_s2_pfnofix()
+ {
+-    static const bool v = *detail::flag(453, 0);
++    static const bool v = *detail::flag(456, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_S2_PFPOISON
+ inline bool test_s2_pfpoison()
+ {
+-    static const bool v = *detail::flag(454, 0);
++    static const bool v = *detail::flag(457, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_S2_POOL
+ inline std::optional<int64_t> test_s2_pool()
+ {
+-    static const std::optional<int64_t> v = detail::int_(455, 0);
++    static const std::optional<int64_t> v = detail::int_(458, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_S2_RELOC
+ inline bool test_s2_reloc()
+ {
+-    static const bool v = *detail::flag(456, 0);
++    static const bool v = *detail::flag(459, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_S2_RELOC_PAGES
+ inline std::optional<int64_t> test_s2_reloc_pages()
+ {
+-    static const std::optional<int64_t> v = detail::int_(457, 0);
++    static const std::optional<int64_t> v = detail::int_(460, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_S2_ROWHASH
+ inline bool test_s2_rowhash()
+ {
+-    static const bool v = *detail::flag(458, 0);
++    static const bool v = *detail::flag(461, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_S2_RUNS
+ inline const std::optional<std::string>& test_s2_runs()
+ {
+-    static const std::optional<std::string> v = detail::text(459, 0);
++    static const std::optional<std::string> v = detail::text(462, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_S2_SHRINK_AT
+ inline std::optional<int64_t> test_s2_shrink_at()
+ {
+-    static const std::optional<int64_t> v = detail::int_(460, 0);
++    static const std::optional<int64_t> v = detail::int_(463, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_S2_SOLO1
+ inline bool test_s2_solo1()
+ {
+-    static const bool v = *detail::flag(461, 0);
++    static const bool v = *detail::flag(464, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_S2_XLIST
+ inline const std::optional<std::vector<int64_t>>& test_s2_xlist()
+ {
+-    static const std::optional<std::vector<int64_t>> v = detail::ints(462, 0);
++    static const std::optional<std::vector<int64_t>> v = detail::ints(465, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_TOKENIZER_DIR
+ inline const std::optional<std::string>& test_tokenizer_dir()
+ {
+-    static const std::optional<std::string> v = detail::text(463, 0);
++    static const std::optional<std::string> v = detail::text(466, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_VISION_CASES
+ inline const std::optional<std::string>& test_vision_cases()
+ {
+-    static const std::optional<std::string> v = detail::text(464, 0);
++    static const std::optional<std::string> v = detail::text(467, 0);
+     return v;
+ }
+ 
+ /// GR8_TEST_ZERO_DELAY_MS
+ inline int64_t test_zero_delay_ms()
+ {
+-    static const int64_t v = *detail::int_(465, 0);
++    static const int64_t v = *detail::int_(468, 0);
+     return v;
+ }
+ 
+ /// TMPDIR
+ inline const std::string& tmpdir()
+ {
+-    static const std::string v = *detail::text(466, 0);
++    static const std::string v = *detail::text(469, 0);
+     return v;
+ }
+ 
+ /// GR8_TR3_W2ALL
+ inline bool tr3_w2all()
+ {
+-    static const bool v = *detail::flag(467, 0);
++    static const bool v = *detail::flag(470, 0);
+     return v;
+ }
+ 
+ /// GR8_V2_SHARED
+ inline const std::optional<std::string>& v2_shared()
+ {
+-    static const std::optional<std::string> v = detail::text(468, 0);
++    static const std::optional<std::string> v = detail::text(471, 0);
+     return v;
+ }
+ 
+ /// GR8_WARM
+ inline int64_t warm()
+ {
+-    static const int64_t v = *detail::int_(469, 0);
++    static const int64_t v = *detail::int_(472, 0);
+     return v;
+ }
+ 
+ /// GR8_WEIGHT_CHECK
+ inline bool weight_check()
+ {
+-    static const bool v = *detail::flag(470, 0);
++    static const bool v = *detail::flag(473, 0);
+     return v;
+ }
+ 
+ /// GR8_WEIGHT_CHECK_FLIP
+ inline const std::optional<std::string>& weight_check_flip()
+ {
+-    static const std::optional<std::string> v = detail::text(471, 0);
++    static const std::optional<std::string> v = detail::text(474, 0);
+     return v;
+ }
+ 
+ /// GR8_WIDTHS
+ inline const std::optional<std::string>& widths()
+ {
+-    static const std::optional<std::string> v = detail::text(472, 0);
++    static const std::optional<std::string> v = detail::text(475, 0);
+     return v;
+ }
+ 
+ /// GR8_WORK_DIR
+ inline const std::optional<std::string>& work_dir()
+ {
+-    static const std::optional<std::string> v = detail::text(473, 0);
++    static const std::optional<std::string> v = detail::text(476, 0);
+     return v;
+ }
+ 
+ /// GR8_XGRAMMAR
+ inline const std::optional<std::string>& xgrammar()
+ {
+-    static const std::optional<std::string> v = detail::text(474, 0);
++    static const std::optional<std::string> v = detail::text(477, 0);
+     return v;
+ }
+ 
+ /// GR8_XGRAMMAR_LIB
+ inline const std::optional<std::string>& xgrammar_lib()
+ {
+-    static const std::optional<std::string> v = detail::text(475, 0);
++    static const std::optional<std::string> v = detail::text(478, 0);
+     return v;
+ }
+ 
+ /// GR8_XTRACE
+ inline bool xtrace()
+ {
+-    static const bool v = *detail::flag(476, 0);
++    static const bool v = *detail::flag(479, 0);
+     return v;
+ }
+ 
+ /// GR8_XTRACE_OUT
+ inline const std::optional<std::string>& xtrace_out()
+ {
+-    static const std::optional<std::string> v = detail::text(477, 0);
++    static const std::optional<std::string> v = detail::text(480, 0);
+     return v;
+ }
+ 
+ /// GR8_XTRACE_PF
+ inline bool xtrace_pf()
+ {
+-    static const bool v = *detail::flag(478, 0);
++    static const bool v = *detail::flag(481, 0);
+     return v;
+ }
+ 
+ /// GR8_XTRACE_QUIT
+ inline const std::optional<std::string>& xtrace_quit()
+ {
+-    static const std::optional<std::string> v = detail::text(479, 0);
++    static const std::optional<std::string> v = detail::text(482, 0);
+     return v;
+ }
+ 
+diff --git a/knobs/prefill.yaml b/knobs/prefill.yaml
+index e1ef915..92f9ec4 100644
+--- a/knobs/prefill.yaml
++++ b/knobs/prefill.yaml
+@@ -185,6 +185,32 @@ knobs:
+       Mistral Large 4 prefill (all-reduce form): each rank scores and selects the index top-k of only its quarter of
+       a sub-batch's rows on the full-index layers and the ranks all-gather the selected ids (a third prefill
+       collective), instead of every rank scoring every row. Same selections, so the same bits.
++  GR8_PF_SPV:
++    scope: agree
++    kind: int
++    default: "4"
++    values: "0..4"
++    doc: >-
++      Prefill sparse attention value pass (same bits): 0 = fp32 probabilities, 64 context columns x 128 staged keys a
++      CTA (the old pass); 1..4 = the probabilities rounded to half in place by the normalize, then 128 x 128,
++      128 x 64, 64 x 128, 256 x 32 (default: 28K prefill values 6.1 -> 3.9 s).
++  GR8_PF_SQK:
++    scope: agree
++    kind: int
++    default: "1"
++    values: "0..4"
++    doc: >-
++      Prefill sparse attention score pass (same bits): 0 = 64 keys x 64 staged dims a CTA (the old pass); 1..4 =
++      128 x 32 (default: 28K prefill scores 4.85 -> 3.96 s), 256 x 32, 128 x 64, 256 x 16.
++  GR8_PF_USTAT:
++    scope: local
++    kind: flag
++    default: "0"
++    values: "0|1"
++    doc: >-
++      Diagnostic: times each prefill attention stage (CUDA events, dense and sparse totals printed every 432 calls)
++      and after each call counts the distinct keys the selections of blocks of 16, 32 and 64 consecutive rows cover
++      (the keys a block-shared attention would read). Synchronizes.
+   GR8_PF_MOE8:
+     scope: agree
+     kind: flag
+-- 
+2.43.0
+
